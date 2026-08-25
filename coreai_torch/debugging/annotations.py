@@ -24,7 +24,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol, TextIO, runtime_checkable
+from typing import Any, Protocol, TextIO, runtime_checkable
 
 from coreai._compiler.ir import Operation
 from rich.console import Console
@@ -104,6 +104,11 @@ class _Annotation(Protocol):
     An annotation supplies text; the listing decides the comment marker and the
     indentation, so the same annotation reads correctly above Python source and
     beside a line of printed Core AI.
+
+    :meth:`lines` renders for a reader, :meth:`data` returns the same annotation as
+    plain values. Both exist because a consumer that formats its own output -- an
+    editor decorating a line, say -- needs the values rather than a string it would
+    have to parse back.
     """
 
     def lines(self: Self) -> Iterable[_AnnotationLine]:
@@ -112,6 +117,17 @@ class _Annotation(Protocol):
 
         Returns:
             The lines, in display order.
+
+        """
+        ...
+
+    def data(self: Self) -> dict[str, Any]:
+        """
+        Return this annotation as plain values, ready to serialize.
+
+        Returns:
+            The annotation's fields. Presentation (styles, comment markers) is not
+            included; only what the annotation is about.
 
         """
         ...
@@ -136,6 +152,17 @@ class _TextAnnotation:
 
         """
         return (_AnnotationLine(self.text, self.color),)
+
+    def data(self: Self) -> dict[str, Any]:
+        """
+        Return the annotation's text.
+
+        Returns:
+            ``{"text": <text>}``. A plain text annotation has nothing structured
+            behind it; one that does should carry its own fields.
+
+        """
+        return {"text": self.text}
 
     def write(self: Self, output: TextIO) -> None:
         """

@@ -115,15 +115,20 @@ async def test_module_timings(
         has_content = len(module.operation_timings) > 0 or len(module.children) > 0
         assert has_content, f"Module {module_name} should have operations or children"
 
-        # If module has operations, check total_time
+        # A module reports no total -- fusion crosses module boundaries, so one
+        # would charge a module for a sibling's work. Its dispatches carry the
+        # timing instead.
         if module.operation_timings:
-            total_time_stats = module.total_time
-            assert total_time_stats is not None, (
-                f"Module {module_name} should have timing statistics"
-            )
-            assert total_time_stats.average > 0, (
-                f"Module {module_name} should have positive average time"
-            )
+            for timing in module.get_all_operations():
+                assert timing.measurement.statistics is not None, (
+                    f"Dispatch {timing.op_ids} in {module_name} should have statistics"
+                )
+
+        # type_name and instance split the frame the stack trace gave
+        assert module.type_name, "Module should have a type name"
+        assert module.instance is None or module.instance > 0, (
+            f"Module {module_name} instance should be positive when known"
+        )
 
         # Test write_to method - we can't easily test TextIO output directly,
         # but we can verify it doesn't throw an error

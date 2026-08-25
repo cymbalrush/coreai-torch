@@ -18,6 +18,7 @@ from coreai_torch.debugging.graph_diff import (
     compute_exported_program_diff,
     compute_per_graph_diff,
     format_multi_graph_diff,
+    op_id_alignment,
     write_diff,
 )
 
@@ -442,3 +443,49 @@ async def test_compute_coreai_program_diff_all_graphs() -> None:
     # Should have computed a diff
     assert diff.summary.source_node_count > 0
     assert diff.summary.target_node_count > 0
+
+
+@pytest.mark.asyncio
+async def test_op_id_alignment_identical_programs() -> None:
+    """An unchanged model maps every operation to itself, and says so."""
+    model = ThreeLinearModel().eval()
+    args = tuple(get_example_inputs(ThreeLinearModel).values())
+
+    exported = torch.export.export(model, args).run_decompositions()
+    before = await _create_coreai_program_from_model(exported)
+    after = await _create_coreai_program_from_model(
+        torch.export.export(model, args).run_decompositions()
+    )
+
+    alignment = op_id_alignment(before, after)
+
+    assert alignment.identical, "Rebuilding the same model should be the same graph"
+    assert alignment.mapping, "Should map operations"
+    assert not alignment.removed
+    assert not alignment.added
+    assert not alignment.modified
+    # Nothing moved, so every operation keeps its id -- which is exactly why raw ids
+    # look safe to compare until an edit renumbers them.
+    assert all(source == target for source, target in alignment.mapping.items())
+
+
+@pytest.mark.asyncio
+async def test_op_id_alignment_survives_an_added_layer() -> None:
+    """An added layer renumbers ids; the mapping still pairs what survived."""
+    args = tuple(get_example_inputs(ThreeLinearModel).values())
+    before = await _create_coreai_program_from_model(
+        torch.export.export(ThreeLinearModel().eval(), args).run_decompositions()
+    )
+    after = await _create_coreai_program_from_model(
+        torch.export.export(ExtraLayerModel().eval(), args).run_decompositions()
+    )
+
+    alignment = op_id_alignment(before, after)
+
+    assert not alignment.identical, "An added layer is a different graph"
+    assert alignment.mapping, "Operations either side of the addition should pair"
+    assert alignment.added, "The added layer's operations have no counterpart"
+    # A mapped pair is one operation, so no id may be claimed twice on either side.
+    assert len(set(alignment.mapping.values())) == len(alignment.mapping)
+    assert not set(alignment.mapping) & set(alignment.removed)
+    assert not set(alignment.mapping.values()) & set(alignment.added)

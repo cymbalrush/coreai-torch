@@ -60,6 +60,26 @@ def _walk_operations(coreai_program: AIProgram) -> list[Operation]:
     return [operation for operation, _ in _walk_operation(module)]
 
 
+def split_module_frame(frame: str) -> tuple[str, int | None]:
+    """
+    Split a stack-trace module frame into its type and instance number.
+
+    A frame names an instance, not a type -- ``Linear$3`` is the third ``Linear``.
+    Splitting is what lets a caller group instances of one type together without
+    re-parsing the name itself.
+
+    Args:
+        frame: Module frame as the stack trace gives it, e.g. ``"Linear$3"``.
+
+    Returns:
+        The type name and the instance number, the latter None when the frame
+        carries no number (``<unknown>``, or a name with no ``$``).
+
+    """
+    type_name, _, suffix = frame.partition("$")
+    return type_name, int(suffix) if suffix.isdigit() else None
+
+
 @dataclass(frozen=True)
 class LocationInfo:
     """

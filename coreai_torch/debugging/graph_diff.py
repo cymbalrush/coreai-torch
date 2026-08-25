@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import re
 import sys
-from dataclasses import dataclass, fields
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from io import StringIO
 from typing import Any, TextIO
@@ -26,7 +27,9 @@ import torch
 from coreai._compiler.ir import Block, Operation, Region, Value
 from coreai.authoring import AIProgram
 
+from .debug_info import get_operation_id
 from .graph_match import (
+    _OP_NODE,
     Label,
     WeightPolicy,
     align,
@@ -40,7 +43,10 @@ from .table_writer import _Column, _Row, _TableSpec, _write_table
 # ---------------------------------------------------------------------------
 
 _CALLEE_SYMBOL_RE = re.compile(r"<@([^>]+)>")
-_UUID_SUFFIX_RE = re.compile(r"_[0-9a-f]{8,}$")
+# `coreai.graph`'s deferred-construction path draws this from `string.ascii_lowercase`
+# only, never digits -- see `_composite_label`'s docstring. Matched here only as a
+# fallback for a composite whose `template_op` attribute is unavailable.
+_UUID_SUFFIX_RE = re.compile(r"_[a-z]{8,}$")
 
 
 class OpDiffType(Enum):
@@ -242,6 +248,13 @@ class GraphDiff:
         summary: Summary statistics
         source_graph: Source NetworkX graph with IR references in nodes
         target_graph: Target NetworkX graph with IR references in nodes
+        weights: The `WeightPolicy` this diff was computed under. `write_diff` reads
+            it back to label a modified pair's *reason* under the same policy that
+            decided the pair was not identical -- `node_labels` defaults to `IGNORE`,
+            and a reason computed under a different policy than the one that rejected
+            the pair can describe the wrong thing: an IGNORE-computed label elides a
+            parameter's value, so a DIGEST-only difference is invisible to it and the
+            true reason (`attributes: ...`) is never reached.
 
     Lifetime: the two graphs hold `ir_object` references owned by the programs they
     were built from, and comparison reads them lazily. A `GraphDiff` is therefore
@@ -261,6 +274,7 @@ class GraphDiff:
     summary: GraphDiffSummary
     source_graph: nx.DiGraph
     target_graph: nx.DiGraph
+    weights: WeightPolicy = WeightPolicy.IGNORE
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +414,7 @@ def compute_graph_diff(
         summary=summary,
         source_graph=source_graph,
         target_graph=target_graph,
+        weights=weights,
     )
 
 
@@ -462,6 +477,117 @@ def _collect_entry_points(module: Any) -> dict[str, Any]:
     return entry_points
 
 
+@dataclass(frozen=True)
+class OpIdAlignment:
+    """Which Core AI operation of one program became which of another."""
+
+    mapping: dict[int, int] = field(default_factory=dict)
+    """Before op id -> after op id, for operations that correspond."""
+
+    modified: set[int] = field(default_factory=set)
+    """Before ids in :attr:`mapping` whose counterpart is the same operation wired or
+    configured differently, so a difference in it may be the rewiring itself."""
+
+    removed: list[int] = field(default_factory=list)
+    """Before ids with no counterpart."""
+
+    added: list[int] = field(default_factory=list)
+    """After ids with no counterpart."""
+
+    identical: bool = False
+    """Whether the two programs are provably the same graph. Any difference measured
+    between runs of an identical program is noise, which is what makes such a pair
+    worth running deliberately."""
+
+
+def _coreai_ids(graph: nx.DiGraph) -> dict[int, int]:
+    """
+    Map each operation node of *graph* to the Core AI op id it carries.
+
+    Node ids come from a counter over the whole build -- values, regions and blocks
+    included -- so they are neither op ids nor comparable between programs. The
+    operation each op node stores is what carries the id.
+
+    Args:
+        graph: Graph built by :func:`_build_module_graph`.
+
+    Returns:
+        Node id -> Core AI op id, for operation nodes carrying one.
+
+    """
+    ids: dict[int, int] = {}
+    for node, data in graph.nodes(data=True):
+        if data.get("type") != _OP_NODE:
+            continue
+        operation = data.get("ir_object")
+        if operation is None:
+            continue
+        op_id = get_operation_id(operation)
+        if op_id is not None:
+            ids[node] = op_id
+    return ids
+
+
+def op_id_alignment(
+    before: AIProgram,
+    after: AIProgram,
+    entry_point: str = "main",
+    *,
+    weights: WeightPolicy = WeightPolicy.IGNORE,
+) -> OpIdAlignment:
+    """
+    Which Core AI operation of *before* became which of *after*.
+
+    Core AI op ids are positional, so inserting a layer renumbers everything after
+    it. Comparing two programs by raw op id therefore compares unrelated operations,
+    and does so quietly: most ids survive an edit unchanged.
+
+    Args:
+        before: The "before" program.
+        after: The "after" program.
+        entry_point: Function to compare.
+        weights: Whether parameter *values* count towards an operation's identity.
+            Ignored by default: a rebuild re-initialises them, which would report
+            every edit as a total rewrite.
+
+    Returns:
+        The correspondence, and what it leaves over.
+
+    """
+    before_graph = _build_module_graph(before._mlir_module, entry_point)
+    after_graph = _build_module_graph(after._mlir_module, entry_point)
+    alignment = align(before_graph, after_graph, weights=weights)
+
+    before_ids = _coreai_ids(before_graph)
+    after_ids = _coreai_ids(after_graph)
+
+    mapping: dict[int, int] = {}
+    modified: set[int] = set()
+    # Exact pairs first, then modified ones: a modified pair is the same operation
+    # rewired, so it is a correspondence rather than a removal plus an addition --
+    # but which pairs those are is worth reporting.
+    for source, target in alignment.mapping.items():
+        if source in before_ids and target in after_ids:
+            mapping[before_ids[source]] = after_ids[target]
+    for source, target in alignment.modified:
+        if source in before_ids and target in after_ids:
+            mapping[before_ids[source]] = after_ids[target]
+            modified.add(before_ids[source])
+
+    return OpIdAlignment(
+        mapping=mapping,
+        modified=modified,
+        removed=sorted(
+            {before_ids[n] for n in alignment.removed if n in before_ids} - set(mapping)
+        ),
+        added=sorted(
+            {after_ids[n] for n in alignment.added if n in after_ids}
+            - set(mapping.values())
+        ),
+        identical=alignment.identical,
+    )
+
+
 def _extract_invoke_callee(graph: nx.DiGraph, node_id: int) -> str | None:
     """Extract callee symbol name from a coreai.invoke node."""
     node = graph.nodes[node_id]
@@ -479,8 +605,45 @@ def _extract_invoke_callee(graph: nx.DiGraph, node_id: int) -> str | None:
 
 
 def _strip_uuid_suffix(name: str) -> str:
-    """Strip trailing UUID suffix for display: 'sdpa_abc123ef' -> 'sdpa'."""
+    """
+    Strip trailing random suffix for display: 'sdpa_maskless_qxrbmzua' -> 'sdpa_maskless'.
+
+    A best-effort fallback for when the generating `GraphOp` carries no `template_op`
+    attribute (see `_composite_label`) -- pattern-matching a randomised suffix rather
+    than reading what named it. `coreai.graph`'s deferred-construction path draws the
+    suffix from `string.ascii_lowercase` only, 8 characters, never digits (see
+    `coreai._compiler.dialects.coreai.graph._randomize_fn_name`), which is what
+    `_UUID_SUFFIX_RE` matches. A composite created some other way, or a future
+    generator using a different alphabet, may not match; the name is then shown as
+    printed, suffix and all, rather than stripped incorrectly.
+    """
     return _UUID_SUFFIX_RE.sub("", name)
+
+
+def _composite_label(sym_name: str, entry_points: Mapping[str, Any]) -> str:
+    """
+    Human-readable name for a composite callee.
+
+    Prefers `template_op`, the pre-randomisation name the generating `GraphOp`
+    recorded verbatim alongside its randomised symbol name -- see
+    `coreai._compiler.dialects.coreai.graph._generate_fn_with_body`, which sets both
+    together. Exact and independent of the suffix's alphabet or length, unlike
+    `_strip_uuid_suffix`, which has to guess the pattern and cannot: composite names
+    are not a closed set to match against, since module externalization lets a caller
+    register one under any name it chooses.
+
+    Args:
+        sym_name: The composite's (possibly suffixed) symbol name.
+        entry_points: `sym_name -> GraphOp`, as `_collect_entry_points` returns.
+
+    Returns:
+        `template_op` when the op carries one, else `sym_name` with a
+        best-effort suffix strip.
+
+    """
+    op = entry_points.get(sym_name)
+    template_op = getattr(op, "template_op", None) if op is not None else None
+    return template_op or _strip_uuid_suffix(sym_name)
 
 
 # ---------------------------------------------------------------------------
@@ -616,10 +779,13 @@ def _describe_modification(
         return "rewired: " + ", ".join(f"operand {index}" for index in moved)
 
     # Nothing else is left. Verification rejected this pair, and it rejects only on
-    # a label mismatch or an operand mismatch; the labels here are the ones with
-    # parameter values *left out*, and the operands correspond. So the values are
-    # what differ -- which is only reachable when the diff was computed under
-    # `WeightPolicy.DIGEST`, since that is the only policy that looks at them.
+    # a label mismatch or an operand mismatch. `labels` is now computed under the
+    # diff's own policy (see `GraphDiff.weights`), so a genuine value-only
+    # difference is already caught above as an `attributes: ...` label mismatch --
+    # this fallback is a last resort for the rare case where this function's
+    # after-the-fact recomputation disagrees with `align`'s own internal check
+    # (e.g. `DIGEST_PORTABLE`, whose blob digests need `blobs=` and are not
+    # recomputed here), not the primary way a value difference gets named.
     return "parameter values differ"
 
 
@@ -674,7 +840,15 @@ def _format_unified_ops_table(
     # about one op.
     claimed_source: set[int] = set()
     claimed_target: set[int] = set()
-    labels = (node_labels(source_graph), node_labels(target_graph))
+    # Under the same policy the diff itself was computed under -- `node_labels`
+    # defaults to IGNORE, which elides a parameter's value, so a DIGEST-only
+    # difference would otherwise never reach the "attributes: ..." branch below and
+    # `_describe_modification` would report a vaguer reason for exactly the pair
+    # that policy exists to catch.
+    labels = (
+        node_labels(source_graph, diff.weights),
+        node_labels(target_graph, diff.weights),
+    )
 
     for src_node, tgt_node in diff.modified_node_pairs:
         src_id = responsible_op(source_graph, src_node)
@@ -697,9 +871,19 @@ def _format_unified_ops_table(
                 OpDiffType.MODIFIED.value,
                 source_graph.nodes[src_id].get("op_name", "unknown"),
                 target_graph.nodes[tgt_id].get("op_name", "unknown"),
+                # Described against the *responsible ops*, not the raw pair. A
+                # difference on a leaf op (a constant, no operands) often lands on
+                # its result value instead: a value's Label never carries
+                # `attributes`, so the op producing it is not what was compared and
+                # a real value change is invisible, falling through to a vaguer
+                # "rewired"/"parameter values differ" guess. The op just confirmed
+                # `_is_one_op_changed` is the same op on both sides, whether or not
+                # `align` ever paired it -- `_describe_modification`'s first check
+                # only needs the two labels, not a correspondence entry for either
+                # id, so describing the op directly is always at least as precise.
                 _describe_modification(
-                    src_node,
-                    tgt_node,
+                    src_id,
+                    tgt_id,
                     labels,
                     (source_graph, target_graph),
                     diff.source_to_target_mapping,
@@ -931,7 +1115,7 @@ def _diff_matched_composites(
         src_graph = _build_module_graph(source_module, src_callee)
         tgt_graph = _build_module_graph(target_module, tgt_callee)
         diff = compute_graph_diff(src_graph, tgt_graph, weights=weights)
-        label = _strip_uuid_suffix(src_callee)
+        label = _composite_label(src_callee, source_eps)
         results.append(
             (f"{label} (source: @{src_callee}, target: @{tgt_callee})", diff)
         )
@@ -942,6 +1126,8 @@ def _report_unmatched_composites(
     main_diff: GraphDiff,
     source_main_graph: nx.DiGraph,
     target_main_graph: nx.DiGraph,
+    source_eps: dict[str, Any],
+    target_eps: dict[str, Any],
     matched_src_callees: set[str],
     matched_tgt_callees: set[str],
 ) -> list[tuple[str, GraphDiff | None]]:
@@ -951,14 +1137,14 @@ def _report_unmatched_composites(
     for src_id in main_diff.unmapped_source_nodes:
         src_callee = _extract_invoke_callee(source_main_graph, src_id)
         if src_callee and src_callee not in matched_src_callees:
-            label = _strip_uuid_suffix(src_callee)
+            label = _composite_label(src_callee, source_eps)
             results.append((f"REMOVED composite: {label} (@{src_callee})", None))
             matched_src_callees.add(src_callee)
 
     for tgt_id in main_diff.unmapped_target_nodes:
         tgt_callee = _extract_invoke_callee(target_main_graph, tgt_id)
         if tgt_callee and tgt_callee not in matched_tgt_callees:
-            label = _strip_uuid_suffix(tgt_callee)
+            label = _composite_label(tgt_callee, target_eps)
             results.append((f"ADDED composite: {label} (@{tgt_callee})", None))
             matched_tgt_callees.add(tgt_callee)
 
@@ -979,7 +1165,7 @@ def _report_orphan_composites(
 
     for sym_name in source_eps:
         if sym_name != "main" and sym_name not in matched_src_callees:
-            label = _strip_uuid_suffix(sym_name)
+            label = _composite_label(sym_name, source_eps)
             if sym_name in target_eps:
                 src_graph = _build_module_graph(source_module, sym_name)
                 tgt_graph = _build_module_graph(target_module, sym_name)
@@ -998,7 +1184,7 @@ def _report_orphan_composites(
             and sym_name not in matched_tgt_callees
             and sym_name not in source_eps
         ):
-            label = _strip_uuid_suffix(sym_name)
+            label = _composite_label(sym_name, target_eps)
             results.append((f"ADDED composite: {label} (@{sym_name})", None))
 
     return results
@@ -1070,6 +1256,8 @@ def compute_per_graph_diff(
             main_diff,
             source_main_graph,
             target_main_graph,
+            source_eps,
+            target_eps,
             matched_src_callees,
             matched_tgt_callees,
         )

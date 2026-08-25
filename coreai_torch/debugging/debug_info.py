@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, TextIO
 
 import coreai._compiler._mlir_libs._coreaiIR._bindings.mlir as _mlir
@@ -32,6 +33,37 @@ from .table_writer import _Column, _Row, _TableSpec, _write_table
 # Stand-in filename for a location that carries only an operation id, with no real
 # source position behind it. Left out of a rendered summary.
 _OP_ID_PSEUDO_FILE = "op_id"
+
+
+class _Delegate(Enum):
+    """Enumerates the compute delegates an operation may be dispatched to."""
+
+    BNNS = "BNNS"
+    MPS = "MPS"
+    FALLBACK = "FALLBACK"
+    UNKNOWN = "UNKNOWN"
+
+    @classmethod
+    def from_string(cls, identifier: str) -> "_Delegate":
+        """Create a :class:`_Delegate` from its string representation.
+
+        Args:
+            identifier: The delegate identifier.
+
+        Returns:
+            The matching :class:`_Delegate` member, or
+            :attr:`_Delegate.UNKNOWN` if the string does not start with any
+            known delegate prefix.
+        """
+        identifier = identifier.lower()
+        if identifier.startswith("bnns"):
+            return cls.BNNS
+        elif identifier.startswith("mps"):
+            return cls.MPS
+        elif identifier.startswith("odix"):
+            return cls.FALLBACK
+        else:
+            return cls.UNKNOWN
 
 
 @dataclass
@@ -263,6 +295,12 @@ def _format_metadata_value(value: Metadata.Value) -> str:
 class DebugInfo:
     """Represents debug information for a single operation."""
 
+    class SymbolType(str, Enum):
+        """Enumerates the kinds of symbols carried in "symbol" metadata."""
+
+        FUNCTION = "function"
+        DELEGATE = "delegate"
+
     odix_id: int
     name: str
     source_locations: tuple[SourceLocation, ...]
@@ -344,6 +382,84 @@ class DebugInfo:
                 ids.append(value_field)
 
         return ids
+
+    def get_symbol_names(self, symbol_type: "DebugInfo.SymbolType") -> list[str]:
+        """
+        Get all symbol names for a given symbol type.
+
+        Collects every "symbol" metadata entry whose "type" field matches
+        *symbol_type* and returns the corresponding "value" fields. Mirrors the
+        "op_id" metadata structure, but the symbol name is a string carried in the
+        "value" field rather than an integer.
+
+        Args:
+            symbol_type: Symbol type, either
+                :attr:`DebugInfo.SymbolType.FUNCTION` or
+                :attr:`DebugInfo.SymbolType.DELEGATE`.
+
+        Returns:
+            List of symbol names matching the given type.
+
+        """
+        names: list[str] = []
+        for metadata in self.metadatas:
+            if metadata.key != "symbol":
+                continue
+
+            if metadata.value.value_type != "dictionary" or not isinstance(
+                metadata.value.value,
+                dict,
+            ):
+                continue
+
+            type_field = self._get_str_field(metadata.value.value, "type")
+            if type_field != symbol_type.value:
+                continue
+
+            name_field = self._get_str_field(metadata.value.value, "value")
+            if name_field is not None:
+                names.append(name_field)
+
+        return names
+
+    def get_symbol_name(self, symbol_type: "DebugInfo.SymbolType") -> str | None:
+        """
+        Get the symbol name for a given symbol type.
+
+        Format: metadata with key "symbol" containing dictionary
+        ``{"type": "<function|delegate>", "value": <name>}``. Mirrors the
+        :meth:`get_op_id` structure but returns the string symbol name carried in
+        the "value" field.
+
+        Args:
+            symbol_type: Symbol type, either
+                :attr:`DebugInfo.SymbolType.FUNCTION` or
+                :attr:`DebugInfo.SymbolType.DELEGATE`.
+
+        Returns:
+            Symbol name if present, None otherwise.
+
+        """
+        symbol_names = self.get_symbol_names(symbol_type=symbol_type)
+        return symbol_names[0] if len(symbol_names) > 0 else None
+
+    def is_symbol(self) -> bool:
+        """
+        Whether this operation represents a symbol rather than a real op.
+
+        Returns ``True`` if the operation carries a ``"symbol"`` metadata entry of
+        any :class:`DebugInfo.SymbolType` (``function`` or ``delegate``). Such
+        entries are structural markers rather than directly schedulable Core AI
+        operations.
+
+        Returns:
+            ``True`` if a function or delegate symbol is present, else ``False``.
+
+        """
+        return any(
+            self.get_symbol_name(symbol_type) is not None
+            for symbol_type in DebugInfo.SymbolType
+        )
 
     def get_source(self) -> str | None:
         """Get source identifier if present."""
@@ -624,6 +740,11 @@ class DebugInfoRecord:
     identifier: str
     operations: tuple[DebugInfo, ...]
 
+    @property
+    def is_fallback(self) -> bool:
+        """Whether this is a fallback record per :class:`_Delegate`."""
+        return _Delegate.from_string(self.identifier) == _Delegate.FALLBACK
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DebugInfoRecord":
         """Parse from dictionary."""
@@ -812,6 +933,193 @@ def parse_debug_infos(debug_infos_bytes: bytes) -> list[DebugInfoRecord]:
     debug_infos_data = json.loads(debug_infos_str)
 
     return [DebugInfoRecord.from_dict(item) for item in debug_infos_data]
+
+
+def _build_source_to_odix_map(
+    debug_info_records: list[DebugInfoRecord],
+    source_level: str,
+) -> dict[int, int]:
+    """
+    Build a mapping from source op ID to odix ID from fallback debug info records.
+
+    Iterates over the fallback (``"odix"``) records and extracts the source-level
+    op ID and the odix ID from each operation.
+
+    Symbol entries are included deliberately. This map answers "which odix id owns
+    this source op", not "what should be timed" -- and on the GPU path the symbol
+    entries are the only operations carrying source ids at all, so excluding them
+    leaves the map empty and every timing sample unattributable. Timing still never
+    lands on a symbol: :func:`_build_compile_id_to_coreai_map` skips them when it
+    forms groups.
+
+    Args:
+        debug_info_records: Parsed debug information containing operation mappings.
+        source_level: Dialect level to extract source op IDs from (e.g.
+            ``"coreai"``).
+
+    Returns:
+        Dictionary mapping source_op_id to odix_id.
+
+    """
+    source_to_odix: dict[int, int] = {}
+    for record in debug_info_records:
+        if not record.is_fallback:
+            continue
+        for op in record.operations:
+            for source_id in op.get_op_ids(source_level):
+                existing_odix_id = source_to_odix.get(source_id)
+                if existing_odix_id is None or existing_odix_id < op.odix_id:
+                    source_to_odix[source_id] = op.odix_id
+    return source_to_odix
+
+
+def _record_op_id_level(identifier: str) -> str | None:
+    """
+    The dialect level a record numbers its own operations in.
+
+    A record is named ``"<level>_op_id"``, so the level is what remains once that
+    suffix is removed -- ``"odix_op_id"`` numbers ``"odix"``, and a delegate record
+    numbers whatever level its own name gives.
+
+    Note the suffix is stripped rather than the name split on its first underscore:
+    a level whose name itself contains an underscore would otherwise be truncated to
+    its first word, silently selecting a different level's numbering.
+
+    Args:
+        identifier: Record identifier.
+
+    Returns:
+        The level name, or ``None`` if the identifier is not of that form.
+
+    """
+    suffix = "_op_id"
+    if not identifier.endswith(suffix) or len(identifier) == len(suffix):
+        return None
+    return identifier[: -len(suffix)]
+
+
+def _build_delegate_op_to_source_map(
+    debug_info_records: list[DebugInfoRecord],
+    source_level: str = "coreai",
+) -> dict[int, list[int]]:
+    """
+    Build a ``delegate op id -> [source op ids]`` map from the delegate records.
+
+    A delegate reports the operations in a fused dispatch using its own numbering,
+    not the source level's, so timing attributed to those ids has to be translated
+    before it names anything in the converted program. Each delegate record carries
+    both, one per operation, which is what makes the translation possible.
+
+    Args:
+        debug_info_records: Parsed debug information.
+        source_level: Dialect level to translate into (defaults to ``"coreai"``).
+
+    Returns:
+        Dictionary mapping a delegate's operation id to source-level op ids.
+
+    """
+    result: dict[int, list[int]] = {}
+    for record in debug_info_records:
+        # Fallback records number their ops in the same space the runtime reports
+        # directly, so they need no translation.
+        if record.is_fallback:
+            continue
+        level = _record_op_id_level(record.identifier)
+        if level is None:
+            continue
+        for op in record.operations:
+            # Symbols mark a function or delegate rather than schedulable work.
+            if op.is_symbol():
+                continue
+            source_ids = op.get_op_ids(source_level)
+            if not source_ids:
+                continue
+            for delegate_id in op.get_op_ids(level):
+                mapped = result.setdefault(delegate_id, [])
+                for source_id in source_ids:
+                    if source_id not in mapped:
+                        mapped.append(source_id)
+    return result
+
+
+def _build_compile_id_to_coreai_map(
+    debug_info_records: list[DebugInfoRecord],
+    source_level: str = "coreai",
+) -> dict[tuple[int, int | None], list[int]]:
+    """
+    Build a ``(odix_id, delegate_id) -> [source op ids]`` map for the profiler.
+
+    The runtime reports timing both for delegate dispatches (carrying a
+    ``delegate_id``) and for fallback-run ops (``delegate_id`` is ``None``).
+    Delegate records are processed first so each delegate op forms its own
+    per-dispatch group, keyed ``(resolved_odix_id, op.odix_id)`` where the first
+    component comes from :func:`_build_source_to_odix_map`. Fallback records then
+    cover any remaining source ops not handled by a delegate, keyed
+    ``(op.odix_id, None)``. Values are de-duplicated in first-seen order.
+
+    Args:
+        debug_info_records: Parsed debug information.
+        source_level: Dialect level for the op IDs (defaults to ``"coreai"``).
+
+    Returns:
+        Dictionary mapping ``(odix_id, delegate_id)`` to source-level op IDs.
+
+    """
+    source_to_odix_map = _build_source_to_odix_map(debug_info_records, source_level)
+    result: dict[tuple[int, int | None], list[int]] = {}
+    # Source ops already attributed to a delegate dispatch; fallback records only
+    # cover the remaining ops.
+    claimed: set[int] = set()
+
+    # Pass 1: delegate records, one per-dispatch group each.
+    for record in debug_info_records:
+        if record.is_fallback:
+            continue
+        for op in record.operations:
+            delegate_id = op.odix_id
+            for coreai_id in op.get_op_ids(source_level):
+                odix_id = source_to_odix_map.get(coreai_id)
+                if odix_id is None or coreai_id in claimed:
+                    continue
+                coreai_ids = result.setdefault((odix_id, delegate_id), [])
+                if coreai_id not in coreai_ids:
+                    coreai_ids.append(coreai_id)
+                claimed.add(coreai_id)
+
+    # Pass 2: fallback records cover the remaining ops.
+    for record in debug_info_records:
+        if not record.is_fallback:
+            continue
+        for op in record.operations:
+            # Skip symbol ops; they are structural markers, not real ops.
+            if op.is_symbol():
+                continue
+            for coreai_id in op.get_op_ids(source_level):
+                if coreai_id in claimed:
+                    continue
+                coreai_ids = result.setdefault((op.odix_id, None), [])
+                if coreai_id not in coreai_ids:
+                    coreai_ids.append(coreai_id)
+
+    return result
+
+
+def get_operation_id(operation: Operation, level: str = "coreai") -> int | None:
+    """
+    Extract an operation ID from an operation's location.
+
+    Args:
+        operation: Operation whose location carries the operation ID.
+        level: Dialect level to extract the ID for (defaults to ``"coreai"``).
+
+    Returns:
+        The operation ID for *level*, or ``None`` if no ID is present.
+
+    """
+    op_id_obj = _mlir.get_operation_id(operation.location, level)
+    if op_id_obj is None:
+        return None
+    return getattr(op_id_obj, "value", None)
 
 
 def _build_coreai_op_map(program: AIProgram) -> dict[int, "Operation"]:

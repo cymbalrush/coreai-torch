@@ -15,6 +15,8 @@ from typing import Protocol, TextIO, runtime_checkable
 
 from rich.console import Console, RenderableType
 from rich.table import Table
+from rich.text import Text
+from rich.tree import Tree
 from typing_extensions import Self
 
 _DEFAULT_WIDTH = 150
@@ -109,6 +111,35 @@ class _TableSpec:
 
         """
         self.rows.append(row if isinstance(row, _Row) else row.to_row())
+
+
+@dataclass
+class _TreeNode:
+    """A node of a tree to render: its label and the nodes beneath it."""
+
+    label: str
+    """Text for this node. Wraps within the width left by its indentation."""
+
+    children: list[_TreeNode] = field(default_factory=list)
+    """Nodes beneath this one, in display order."""
+
+    style: str = ""
+    """`rich` style applied to this node's label (e.g. ``"dim"``)."""
+
+    def add(self: Self, child: _TreeNode | str) -> _TreeNode:
+        """
+        Append a child node, accepting either a node or a bare label.
+
+        Args:
+            child: The node to append, or a label to wrap in one.
+
+        Returns:
+            The appended node, so a caller can add beneath it.
+
+        """
+        node = _TreeNode(label=child) if isinstance(child, str) else child
+        self.children.append(node)
+        return node
 
 
 def _make_console(
@@ -222,3 +253,44 @@ def _write_table(
 
     """
     _write_renderable(_build_table(spec), output, width=width, color=color)
+
+
+def _build_tree(node: _TreeNode) -> Tree:
+    """
+    Build a `rich` tree from *node*.
+
+    Args:
+        node: The root node.
+
+    Returns:
+        The renderable tree.
+
+    """
+    tree = Tree(Text(node.label, style=node.style) if node.style else node.label)
+    stack = [(node, tree)]
+    while stack:
+        spec_node, rendered = stack.pop()
+        for child in spec_node.children:
+            label = Text(child.label, style=child.style) if child.style else child.label
+            stack.append((child, rendered.add(label)))
+    return tree
+
+
+def _write_tree(
+    node: _TreeNode,
+    output: TextIO | None = None,
+    *,
+    width: int | None = None,
+    color: bool | None = None,
+) -> None:
+    """
+    Render *node* and its descendants to *output*.
+
+    Args:
+        node: The root node.
+        output: Destination stream. Defaults to ``sys.stdout`` when None.
+        width: Console width. Defaults to :data:`_DEFAULT_WIDTH`.
+        color: Force color on or off. When None, `rich` decides from the stream.
+
+    """
+    _write_renderable(_build_tree(node), output, width=width, color=color)

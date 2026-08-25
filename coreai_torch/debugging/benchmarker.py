@@ -16,12 +16,14 @@ Key components:
 - CoreAIBenchmarker: Benchmarker implementation using Core AI Runtime
 """
 
+import asyncio
+import json
 import logging
 import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -31,19 +33,35 @@ import coreai._compiler._mlir_libs._coreaiIR._bindings.mlir as _mlir
 import numpy as np
 from coreai._compiler.ir import Operation, WalkResult
 from coreai.authoring import AIProgram
-from coreai.runtime import AIModel, NDArray, Profiler, SpecializationOptions
+from coreai.runtime import (
+    AIModel,
+    LogEvent,
+    NDArray,
+    Profiler,
+    SpecializationOptions,
+)
 from typing_extensions import Self
 
-from .annotations import _ANNOTATION_STYLE, _write_line
-from .debug_info import DebugInfoRecord, parse_debug_infos
-from .source_annotator import _read_source_file, _should_exclude_location
-from .utils import LocationInfo, get_operation_locations
+from .annotations import _Annotation, _AnnotationCallback, _AnnotationLine
+from .debug_info import (
+    DebugInfoRecord,
+    _build_compile_id_to_coreai_map,
+    _build_delegate_op_to_source_map,
+    get_operation_id,
+    parse_debug_infos,
+)
+from .source_annotator import _annotate_operations
+from .table_writer import (
+    _Column,
+    _Row,
+    _TableSpec,
+    _TreeNode,
+    _write_table,
+    _write_tree,
+)
+from .utils import LocationInfo, get_operation_locations, split_module_frame
 
 logger = logging.getLogger(__name__)
-
-# Constants
-_MAX_OP_NAME_LENGTH = 58
-_TRUNCATED_OP_NAME_LENGTH = 55
 
 
 def _get_default_excluded_operations() -> tuple[str, ...]:
@@ -185,145 +203,141 @@ class Measurement:
         )
 
 
-def _group_operations_by_line(
-    module_timing: "ModuleTiming",
-    file_path: Path,
-) -> dict[int, list[tuple[Operation, "OperationTiming"]]]:
+@dataclass(frozen=True)
+class _TimingAnnotation:
     """
-    Group operations by line number for a specific file.
+    A dispatch's timing as an :class:`_Annotation`.
 
-    Args:
-        module_timing: ModuleTiming to get operations from
-        file_path: Path to match operations against
-
-    Returns:
-        Dictionary mapping line numbers to lists of (operation, timing) tuples
-
+    Carries the numbers rather than a formatted string, so a consumer that renders
+    its own output gets them from :meth:`data` instead of parsing text back.
     """
-    line_timings: dict[int, list[tuple[Operation, OperationTiming]]] = defaultdict(
-        list,
-    )
 
-    for operation, timing in module_timing.get_all_operations():
-        locations = get_operation_locations(operation)
+    op_ids: tuple[int, ...]
+    """Core AI operation IDs the dispatch covered."""
 
-        for loc in locations:
-            # Match by filename (handle both absolute and relative paths)
-            if Path(loc.filename).name == file_path.name or loc.filename == str(
-                file_path,
-            ):
-                line_timings[loc.line].append((operation, timing))
+    op_names: tuple[str, ...]
+    """Names of those operations."""
 
-    return line_timings
+    median_ms: float
+    """Median duration of the dispatch, in milliseconds."""
 
+    average_ms: float
+    """Mean duration of the dispatch, in milliseconds."""
 
-def _annotate_source_file(
-    module_timing: "ModuleTiming",
-    file_path: Path | str,
-    output: TextIO,
-) -> None:
-    """
-    Annotate a source file with timing information from a module.
+    samples: int
+    """How many measurements the statistics are over."""
 
-    Reads the source file, finds operations from that file in the module, and
-    writes the annotated source with a timing comment before each annotated line.
+    def lines(self: Self) -> "tuple[_AnnotationLine, ...]":
+        """
+        Return this timing as a single line.
 
-    The comment is styled by name rather than by escape code, so colour is applied
-    for a terminal and dropped for a file or in-memory stream. Writing the escapes
-    unconditionally left them in the text of every saved listing, which a terminal
-    renders and an editor shows as noise.
+        Returns:
+            One :class:`_AnnotationLine` naming the operations and their timing.
 
-    Args:
-        module_timing: ModuleTiming to get operation timings from
-        file_path: Path to the source file to annotate
-        output: Text stream to write annotated source to (file or stdout)
+        """
+        fused = "+".join(self.op_names) or "unknown"
+        return (
+            _AnnotationLine(
+                f"{fused}: {self.average_ms:.3f}ms (med: {self.median_ms:.3f}ms)",
+                style="",
+            ),
+        )
 
-    """
-    file_path = Path(file_path)
+    def data(self: Self) -> dict[str, Any]:
+        """
+        Return the timing as plain values.
 
-    # Read the source file
-    source_lines = _read_source_file(file_path, output)
-    if source_lines is None:
-        return
+        Returns:
+            The op ids and names the duration covers, and the duration itself. The
+            ids matter as much as the numbers: the duration belongs to the whole
+            dispatch, so a consumer must not add it up per operation.
 
-    # Group operations by line number
-    line_timings = _group_operations_by_line(module_timing, file_path)
-
-    # Annotate and write source lines
-    for line_num, line_content in enumerate(source_lines, start=1):
-        # Write timing annotation BEFORE the source line if present
-        if line_num in line_timings:
-            # Collect timing info for this line
-            timings_for_line = []
-            for operation, timing in line_timings[line_num]:
-                if timing.measurement.statistics:
-                    stats = timing.measurement.statistics
-                    timings_for_line.append(
-                        f"{operation.name}: {stats.average:.3f}ms (med: {stats.median:.3f}ms)",
-                    )
-
-            if timings_for_line:
-                # Indent the comment to match the line it describes, so the
-                # annotated listing stays readable as Python.
-                margin = line_content[: len(line_content) - len(line_content.lstrip())]
-                annotation = margin + "# " + ", ".join(timings_for_line)
-                _write_line(output, annotation, _ANNOTATION_STYLE)
-
-        # Write the original source line
-        output.write(line_content)
+        """
+        return {
+            "op_ids": list(self.op_ids),
+            "op_names": list(self.op_names),
+            "median_ms": self.median_ms,
+            "average_ms": self.average_ms,
+            "samples": self.samples,
+        }
 
 
 @dataclass
 class OperationTiming:
-    """Timing information for a single operation."""
+    """
+    Timing information for a fused group of operations.
 
-    op_id: int
-    """Operation ID from compile identifiers."""
+    The runtime profiler measures a compile identifier -- a possibly-fused group of
+    Core AI ops -- as a whole. The recorded ``measurement`` is the timing of that
+    whole group, and ``op_ids`` lists every Core AI op it contains.
+    """
+
+    op_ids: list[int]
+    """Core AI operation IDs that make up this fused group."""
+
+    operations: list[Operation]
+    """The Core AI operations that make up this fused group.
+
+    A view into the module the ``AIProgram`` owns, so it is valid only while that
+    program is alive; extract what is needed rather than stashing the result."""
 
     measurement: Measurement
     """Measurement containing statistics and timing samples in milliseconds."""
 
-    def write_to(
-        self,
-        output: TextIO,
-        operation: Operation | None = None,
-        prefix: str = "",
-    ) -> None:
+    @property
+    def op_id(self) -> int:
+        """Representative (first) operation ID of the group."""
+        return self.op_ids[0]
+
+    @property
+    def op_names(self) -> list[str]:
+        """Names of the Core AI operations in this group."""
+        return [op.name for op in self.operations]
+
+    def to_row(self: Self) -> _Row:
         """
-        Write operation timing to output.
+        Return this dispatch's cells for the summary table.
 
-        Args:
-            output: Text stream to write to
-            operation: Optional operation object for getting name and ID
-            prefix: Prefix string for indentation (default: "")
+        Every Core AI op id it covers is listed, not a representative: those
+        collide -- four rows read "121" on one model -- leaving rows that measured
+        different work indistinguishable. The ids and names fold within their
+        columns, so a wide fused group stays fully described.
+
+        Returns:
+            The :class:`_Row` describing this dispatch.
 
         """
-        # Get operation name and ID
-        if operation:
-            op_name = operation.name
-            op_id_obj = _mlir.get_operation_id(operation.location, "coreai")  # type: ignore[attr-defined]
-            op_id = getattr(op_id_obj, "value", "N/A") if op_id_obj else "N/A"
-        else:
-            op_name = "unknown"
-            op_id = self.op_id
-
-        # Truncate long operation names
-        if len(op_name) > _MAX_OP_NAME_LENGTH:
-            op_name = op_name[:_TRUNCATED_OP_NAME_LENGTH] + "..."
-
-        # Format and write statistics
-        if self.measurement.statistics:
-            stats = self.measurement.statistics
-            output.write(
-                f"{prefix}{op_id!s:<10} {op_name:<60} "
-                f"{stats.median:<12.6f} {stats.average:<12.6f} "
-                f"{stats.minimum:<12.6f} {stats.maximum:<12.6f} {stats.std_dev:<12.6f}\n",
+        statistics = self.measurement.statistics
+        numbers = (
+            (
+                f"{statistics.median:.6f}",
+                f"{statistics.average:.6f}",
+                f"{statistics.minimum:.6f}",
+                f"{statistics.maximum:.6f}",
+                f"{statistics.std_dev:.6f}",
             )
-        else:
-            output.write(
-                f"{prefix}{op_id!s:<10} {op_name:<60} "
-                f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12}\n",
-            )
+            if statistics is not None
+            else ("N/A",) * 5
+        )
+        return _Row(
+            cells=(
+                ", ".join(str(op_id) for op_id in self.op_ids),
+                "\n".join(self.op_names) or "unknown",
+                *numbers,
+            ),
+        )
+
+    @property
+    def tree_label(self: Self) -> str:
+        """One line naming this dispatch's operations and its timing."""
+        fused = "+".join(self.op_names) or "unknown"
+        statistics = self.measurement.statistics
+        if statistics is None:
+            return f"{fused}: no timing data"
+        return (
+            f"{fused}: med {statistics.median:.6f}ms, avg {statistics.average:.6f}ms, "
+            f"min {statistics.minimum:.6f}ms, max {statistics.maximum:.6f}ms"
+        )
 
 
 @dataclass
@@ -335,54 +349,56 @@ class ModuleTiming:
     """
 
     name: str
-    """Module name."""
+    """Module name as the stack trace gives it, instance number included:
+    ``Linear$3``. Also the key :meth:`BenchmarkResult.get_module_timings` files this
+    module under, so it identifies the instance rather than the type."""
 
-    operation_timings: list[tuple[Operation, OperationTiming]]
-    """List of (operation, timing) tuples for operations in this module."""
+    operation_timings: list[OperationTiming]
+    """Operation timings (one per fused group) belonging to this module."""
 
     children: list["ModuleTiming"]
     """Child modules."""
 
     @property
-    def aggregated_op_stats(self) -> Statistics | None:
+    def type_name(self: Self) -> str:
         """
-        Get aggregated operation statistics for this module (including children).
-
-        Collects all samples from operations in this module and its children,
-        then computes statistics on the combined samples. The resulting statistics
-        represent the distribution of per-operation timings, not per-iteration totals.
+        The module's type, without the instance number.
 
         Returns:
-            Statistics object with aggregated per-operation timing or None if no samples
+            ``"Linear"`` for ``Linear$3``, and the whole name when it carries no
+            instance number.
 
         """
-        # Collect all samples from this module and all children efficiently
-        all_samples = []
-        for _, timing in self.get_all_operations():
-            all_samples.extend(timing.measurement.samples)
-
-        # Return statistics from all collected samples
-        return Statistics.from_values(all_samples)
+        return split_module_frame(self.name)[0]
 
     @property
-    def total_time(self) -> Statistics | None:
+    def instance(self: Self) -> int | None:
         """
-        Get total time statistics for this module.
-
-        This is an alias for aggregated_op_stats for backward compatibility.
+        Which instance of :attr:`type_name` this module is.
 
         Returns:
-            Statistics object with aggregated per-operation timing or None if no samples
+            ``3`` for ``Linear$3``. None when the name carries no instance number,
+            as ``<unknown>`` does.
 
         """
-        return self.aggregated_op_stats
+        return split_module_frame(self.name)[1]
 
-    def get_all_operations(self: Self) -> list[tuple[Operation, OperationTiming]]:
+    # A module deliberately reports no total. Fusion crosses module boundaries --
+    # 86% of dispatches in a 3-layer MLP and 93% in a transformer block cover more
+    # than one module -- and a dispatch is attributed whole to the module of its
+    # first member, so a total charges one module for a sibling's work and leaves
+    # the sibling reading 0.000ms. A LayerNorm fused into its neighbour is not free,
+    # and saying so was worse than saying nothing.
+    #
+    # :meth:`get_all_operations` still exposes the dispatches, so a caller that
+    # knows a group spans modules can aggregate on its own terms.
+
+    def get_all_operations(self: Self) -> list[OperationTiming]:
         """
-        Get all operations in this module and its children recursively.
+        Get all operation timings in this module and its children recursively.
 
         Returns:
-            List of all (operation, timing) tuples
+            List of all OperationTiming objects
 
         """
         all_ops = list(self.operation_timings)
@@ -406,37 +422,83 @@ class ModuleTiming:
     def get_operations_at_location(
         self: Self,
         location: LocationInfo,
-    ) -> list[tuple[Operation, OperationTiming]]:
+    ) -> list[OperationTiming]:
         """
-        Find operations at a specific source location.
+        Find operation timings at a specific source location.
 
-        Searches this module and all children recursively for operations
-        that have the given file/line/col location.
+        Searches this module and all children recursively for timing groups any of
+        whose operations have the given file/line/col location.
 
         Args:
             location: LocationInfo to search for
 
         Returns:
-            List of (operation, timing) tuples matching the location
+            List of OperationTiming objects matching the location
 
         """
         matching_ops = []
 
-        # Search all operations in this module and children
-        for operation, timing in self.get_all_operations():
-            op_locations = get_operation_locations(operation)
-
-            # Check if any of the operation's locations match
-            for op_loc in op_locations:
-                if (
-                    op_loc.filename == location.filename
-                    and op_loc.line == location.line
-                    and op_loc.col == location.col
-                ):
-                    matching_ops.append((operation, timing))
-                    break  # Don't add the same operation twice
+        # Search all operation timings in this module and children
+        for timing in self.get_all_operations():
+            matched = False
+            for operation in timing.operations:
+                for op_loc in get_operation_locations(operation):
+                    if (
+                        op_loc.filename == location.filename
+                        and op_loc.line == location.line
+                        and op_loc.col == location.col
+                    ):
+                        matching_ops.append(timing)
+                        matched = True
+                        break
+                if matched:
+                    break  # Don't add the same timing twice
 
         return matching_ops
+
+    def _annotation_callback(self: Self) -> _AnnotationCallback:
+        """
+        Build the callback describing each operation's timing.
+
+        A group's timing is reported once, on its representative operation. Other
+        members return ``None`` and are skipped: the runtime measured the group as a
+        whole, so there is no per-member figure to give, and annotating each one
+        repeated a single measurement as many times as the group had members --
+        several identical comments stacked above one source line.
+
+        Returns:
+            A callback mapping an operation to its annotation, or ``None`` for an
+            operation this module did not time, or that a group already covers.
+
+        """
+        timing_by_representative: dict[int, OperationTiming] = {
+            timing.op_id: timing for timing in self.get_all_operations()
+        }
+
+        def annotate(operation: Operation) -> _Annotation | None:
+            operation_id = get_operation_id(operation)
+            if operation_id is None:
+                return None
+
+            # Only the representative carries the group's timing; other members of
+            # the same group are covered by it and skipped.
+            timing = timing_by_representative.get(operation_id)
+            if timing is None:
+                return None
+
+            statistics = timing.measurement.statistics
+            if statistics is None:
+                return None
+
+            return _TimingAnnotation(
+                op_ids=tuple(timing.op_ids),
+                op_names=tuple(timing.op_names),
+                median_ms=statistics.median,
+                average_ms=statistics.average,
+                samples=len(timing.measurement.samples),
+            )
+
+        return annotate
 
     def annotate_dominant_source(
         self: Self,
@@ -446,9 +508,10 @@ class ModuleTiming:
         """
         Find the dominant source file and annotate it with timing information.
 
-        Uses operations only from this module (not children). For each operation,
-        gets file/line/col locations, filters them, and takes the last valid file.
-        The dominant file is the one that appears most frequently.
+        Uses operations from this module and its children, and renders through the
+        shared source annotator, so styling follows the destination stream -- colour
+        for a terminal, plain text for a file -- and each comment is indented to
+        match the line it describes.
 
         Args:
             output: Text stream to write annotated source to (file or stdout)
@@ -456,80 +519,72 @@ class ModuleTiming:
                     which excludes torch files, exported_program.py, and "-"
 
         """
-        # Use default exclusion if not provided
-        if exclude is None:
-            exclude = _should_exclude_location
+        operations = [
+            operation
+            for timing in self.get_all_operations()
+            for operation in timing.operations
+        ]
+        _annotate_operations(
+            operations,
+            self._annotation_callback(),
+            output,
+            exclude=exclude,
+        )
 
-        # Count occurrences of each source file from locations
-        file_counts: dict[str, int] = defaultdict(int)
-        # Only use operations from this module, not children
-        for operation, _ in self.operation_timings:
-            # Get file/line/col locations
-            locations = get_operation_locations(operation)
+    def to_tree_node(self: Self, show_operations: bool = False) -> _TreeNode:
+        """
+        Build this module's node, with its children beneath it.
 
-            if locations:
-                # Take the last file (innermost)
-                last_loc = locations[-1]
+        Args:
+            show_operations: Whether to list each dispatch under its module
+                (default: False)
 
-                # Check if it should be excluded
-                if not exclude(last_loc):
-                    last_file = last_loc.filename
+        Returns:
+            The :class:`_TreeNode` for this module.
 
-                    # Only count if file exists
-                    if Path(last_file).exists():
-                        file_counts[last_file] += 1
+        """
+        # A count, not a duration: see the note above :meth:`get_all_operations`.
+        node = _TreeNode(
+            label=(
+                f"{self.name} ({len(self.operation_timings)} "
+                f"dispatch{'es' if len(self.operation_timings) != 1 else ''})"
+                if self.operation_timings
+                else self.name
+            )
+        )
 
-        if not file_counts:
-            output.write("# No valid locations found in operations\n")
-            return
+        if show_operations:
+            for timing in self.operation_timings:
+                node.add(timing.tree_label)
 
-        # Find the most common file (dominant)
-        dominant_file = max(file_counts.items(), key=lambda x: x[1])[0]
+        for child in self.children:
+            node.add(child.to_tree_node(show_operations=show_operations))
 
-        # Annotate the dominant file
-        _annotate_source_file(self, dominant_file, output)
+        return node
 
     def write_to(
         self: Self,
         output: TextIO,
-        indent: int = 0,
         show_operations: bool = False,
+        *,
+        width: int | None = None,
     ) -> None:
         """
-        Write module timing to output.
+        Write this module and its children to output as a tree.
+
+        Rendered through the shared tree writer, so a long fused name wraps within
+        the width its depth leaves rather than being truncated.
 
         Args:
             output: Text stream to write to
-            indent: Indentation level (default: 0)
-            show_operations: Whether to show individual operations (default: False)
+            show_operations: Whether to list each dispatch (default: False)
+            width: Console width to render at. Defaults to
+                :data:`~coreai_torch.debugging.table_writer._DEFAULT_WIDTH`.
 
         """
-        prefix = "  " * indent
-
-        # Module header with statistics
-        stats = self.aggregated_op_stats
-        if stats:
-            output.write(
-                f"{prefix}- {self.name} "
-                f"[Avg: {stats.average:.3f}ms, "
-                f"Median: {stats.median:.3f}ms, "
-                f"Min: {stats.minimum:.3f}ms, "
-                f"Max: {stats.maximum:.3f}ms]\n",
-            )
-        else:
-            output.write(f"{prefix}- {self.name} [No timing data]\n")
-
-        # Show operations if requested
-        if show_operations and self.operation_timings:
-            for operation, timing in self.operation_timings:
-                # Use the timing's write_to method with proper indentation
-                timing.write_to(output, operation, prefix + "  - ")
-        elif self.operation_timings:
-            output.write(f"{prefix}  ({len(self.operation_timings)} operations)\n")
-
-        # Recursively write children
-        for child in self.children:
-            child.write_to(output, indent + 1, show_operations)
+        _write_tree(
+            self.to_tree_node(show_operations=show_operations), output, width=width
+        )
 
 
 @dataclass
@@ -540,113 +595,116 @@ class BenchmarkResult:
     Contains timing information for each operation, organized by operation ID.
     """
 
-    operation_timings: list[tuple[Operation, OperationTiming]]
+    operation_timings: list[OperationTiming]
     """
-    List of (operation, timing) tuples for each profiled operation.
+    List of operation timings, one per profiled fused group of operations.
     """
 
-    total_duration_ns: int
-    """Total execution time in nanoseconds."""
+    operations_by_id: dict[int, Operation] = field(default_factory=dict)
+    """
+    Every Core AI operation in the benchmarked function, by id -- including those no
+    dispatch reported.
 
-    def get_average_timing(self: Self, op_id: int) -> float | None:
+    The denominator for coverage, and which operations count is the caller's
+    judgement: constants and layout operations such as ``pad`` or ``broadcast_to``
+    fold into a consumer's addressing and never become GPU work, so counting them
+    understates coverage badly. An operation absent from every
+    :attr:`OperationTiming.op_ids` was not timed, and its location says where in the
+    source it came from.
+    """
+
+    # No per-operation lookup is offered. A dispatch's duration belongs to every
+    # operation in it, so returning that duration for one op id -- which
+    # `get_average_timing` and `get_measurement` used to do -- reads as the cost of
+    # that operation, and summing over ops then multiplies the real cost by each
+    # group's width. A caller who wants the dispatch an operation landed in can find
+    # it, and sees `op_ids` when they do:
+    #
+    #     op_id = get_operation_id(operation)
+    #     timing = next(
+    #         (t for t in result.operation_timings if op_id in t.op_ids), None
+    #     )
+
+    def get_operation_summary(self: Self) -> list[OperationTiming]:
         """
-        Get average execution time for an operation in milliseconds.
-
-        Args:
-            op_id: Operation ID to get timing for
+        Get operation timings sorted by median duration.
 
         Returns:
-            Average duration in milliseconds, or None if no measurements exist
+            List of OperationTiming sorted by median duration (descending)
 
         """
-        for _, timing in self.operation_timings:
-            if timing.op_id == op_id:
-                if timing.measurement.statistics:
-                    return timing.measurement.statistics.average
-                return None
-        return None
-
-    def get_measurement(self: Self, op_id: int) -> Measurement | None:
-        """
-        Get measurement for an operation.
-
-        Args:
-            op_id: Operation ID to get measurement for
-
-        Returns:
-            Measurement object or None if no measurements exist
-
-        """
-        for _, timing in self.operation_timings:
-            if timing.op_id == op_id:
-                return timing.measurement
-        return None
-
-    def get_operation_summary(self: Self) -> list[tuple[Operation, Measurement]]:
-        """
-        Get summary of operation timings sorted by median duration.
-
-        Returns:
-            List of (operation, measurement) tuples sorted by median duration (descending)
-
-        """
-        summary = [(op, timing.measurement) for op, timing in self.operation_timings]
+        summary = list(self.operation_timings)
 
         # Sort by median duration (descending)
-        summary.sort(key=lambda x: x[1].sort_key, reverse=True)
+        summary.sort(key=lambda timing: timing.measurement.sort_key, reverse=True)
         return summary
 
     def get_module_timings(self) -> dict[str, ModuleTiming]:
         """
-        Group operation timings by modules based on stack traces.
+        Group dispatches by module, from their operations' stack traces.
 
-        Creates a hierarchical tree structure where each level in the stack trace
-        becomes a nested module.
+        Each stack-trace frame becomes a nested module. A dispatch is filed against
+        the deepest module containing *every* operation it covers, so a dispatch
+        listed under a module is wholly inside it. Filing it against its first
+        member's module instead charged one module for a sibling's work -- and fusion
+        crosses module boundaries in most dispatches, so that was the common case,
+        not the exception.
+
+        Modules appear even when no dispatch is filed against them, which is the
+        honest reading of a module whose work always fuses with a sibling's: the
+        structure is there, and nothing is attributed to it alone.
 
         Returns:
             Dictionary mapping module names to ModuleTiming objects at the top level
 
         """
-        # Build module tree structure
         root_modules: dict[str, ModuleTiming] = {}
 
-        for operation, timing in self.operation_timings:
-            # Get stack trace from operation location
-            stack_trace = _mlir.get_stack_trace(operation.location)  # type: ignore[attr-defined]
-
-            # Treat operations without stack traces as belonging to "<unknown>" module
-            if not stack_trace:
-                stack_trace = ["<unknown>"]
-
-            # Build hierarchy from stack trace (outermost to innermost)
-            # The stack trace is already reversed, so first entry is outermost
-            current_level = root_modules
-            parent_module = None
-
-            for frame in stack_trace:
-                # Find or create module at this level
-                if frame not in current_level:
-                    new_module = ModuleTiming(
-                        name=frame,
-                        operation_timings=[],
-                        children=[],
+        def module_at(path: tuple[str, ...]) -> ModuleTiming | None:
+            """Find or create the module at *path*, creating ancestors as needed."""
+            level = root_modules
+            module: ModuleTiming | None = None
+            for frame in path:
+                if frame not in level:
+                    created = ModuleTiming(
+                        name=frame, operation_timings=[], children=[]
                     )
-                    current_level[frame] = new_module
+                    level[frame] = created
+                    if module is not None:
+                        module.children.append(created)
+                module = level[frame]
+                level = {child.name: child for child in module.children}
+            return module
 
-                    # Add to parent's children list if this isn't a root module
-                    if parent_module is not None:
-                        parent_module.children.append(new_module)
+        for timing in self.operation_timings:
+            paths = [
+                tuple(
+                    _mlir.get_stack_trace(operation.location)  # type: ignore[attr-defined]
+                    or ("<unknown>",)
+                )
+                for operation in timing.operations
+            ]
+            if not paths:
+                continue
 
-                parent_module = current_level[frame]
+            # Every member's module exists in the tree, so the hierarchy is complete
+            # whether or not a dispatch is filed against a given module.
+            for path in paths:
+                module_at(path)
 
-                # Move to next level (children)
-                # Build a dict from children for easy lookup
-                children_dict = {child.name: child for child in parent_module.children}
-                current_level = children_dict
+            # The deepest module common to all members contains the whole dispatch.
+            common = paths[0]
+            for path in paths[1:]:
+                limit = min(len(common), len(path))
+                index = 0
+                while index < limit and common[index] == path[index]:
+                    index += 1
+                common = common[:index]
 
-            # Add operation to the deepest (innermost) module
-            if parent_module is not None:
-                parent_module.operation_timings.append((operation, timing))
+            # Members spanning different roots are contained by no module.
+            owner = module_at(common or ("<unknown>",))
+            if owner is not None:
+                owner.operation_timings.append(timing)
 
         return root_modules
 
@@ -654,53 +712,253 @@ class BenchmarkResult:
         self: Self,
         output: TextIO,
         top_n: int | None = None,
+        *,
+        width: int | None = None,
     ) -> None:
         """
         Write benchmark results summary to output.
 
+        One row per dispatch, since that is what the runtime measured: the duration
+        belongs to the listed operations jointly, not to any one of them.
+
         Args:
             output: Text stream to write to
-            top_n: If specified, only show top N slowest operations
+            top_n: If specified, only show top N slowest dispatches
+            width: Console width to render at. Defaults to
+                :data:`~coreai_torch.debugging.table_writer._DEFAULT_WIDTH`.
 
         """
         summary = self.get_operation_summary()
         if top_n is not None:
             summary = summary[:top_n]
 
-        output.write("=" * 150 + "\n")
-        output.write("Benchmark Results\n")
-        output.write("=" * 150 + "\n")
-        output.write(f"Total execution time: {self.total_duration_ns / 1e9:.3f} s\n")
-        output.write(f"Total operations profiled: {len(self.operation_timings)}\n")
-        output.write("\n")
-        output.write("Per-operation timing (sorted by median duration):\n")
-        output.write("-" * 150 + "\n")
-        output.write(
-            f"{'Op ID':<10} {'Operation':<60} {'Median (ms)':<12} "
-            f"{'Avg (ms)':<12} {'Min (ms)':<12} {'Max (ms)':<12} {'StdDev (ms)':<12}\n",
+        spec = _TableSpec(
+            title="Benchmark Results",
+            columns=(
+                _Column("Core AI op ids"),
+                _Column("Operations"),
+                _Column("Median (ms)", justify="right"),
+                _Column("Avg (ms)", justify="right"),
+                _Column("Min (ms)", justify="right"),
+                _Column("Max (ms)", justify="right"),
+                _Column("StdDev (ms)", justify="right"),
+            ),
+            caption=(
+                f"{len(self.operation_timings)} dispatches profiled. A row's duration "
+                f"covers every operation listed in it."
+            ),
+            # Ids and names fold within their columns, so rule between rows to keep
+            # it clear where a wide fused group ends.
+            show_lines=True,
         )
-        output.write("-" * 150 + "\n")
+        for timing in summary:
+            spec.add(timing)
 
-        for operation, measurement in summary:
-            # Find the timing for this operation to use its write_to method
-            timing = None
-            for _, t in self.operation_timings:
-                if t.measurement == measurement:
-                    timing = t
-                    break
+        _write_table(spec, output, width=width)
 
-            if timing:
-                timing.write_to(output, operation)
-            else:
-                # Fallback if timing not found (shouldn't happen)
-                op_name = operation.name if operation else "unknown"
-                op_id = "N/A"
-                output.write(
-                    f"{op_id!s:<10} {op_name:<60} "
-                    f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12}\n",
-                )
 
-        output.write("=" * 150 + "\n")
+@dataclass(frozen=True)
+class EventData:
+    """Structured representation of a profiler log event's encoded data."""
+
+    @dataclass(frozen=True)
+    class Interval:
+        """Timing interval information for an event."""
+
+        duration: int
+        """Duration of the interval (in nanoseconds)."""
+
+        @staticmethod
+        def from_dict(data: dict[str, Any]) -> "EventData.Interval":
+            """
+            Create an Interval instance from a parsed JSON dictionary.
+
+            Args:
+                data: Parsed JSON dictionary, e.g. ``{"duration": 1667}``
+
+            Returns:
+                Interval instance populated from the dictionary
+
+            """
+            return EventData.Interval(duration=data["duration"])
+
+    interval: "EventData.Interval | None" = None
+    """Interval timing information for the event, if present."""
+
+    @dataclass(frozen=True)
+    class CompileIdGroup:
+        """The operations a fused dispatch was built from.
+
+        The runtime emits one of these alongside the interval for a dispatch that
+        fused several operations, keyed on the same compile identifiers, so the
+        group's membership is stated rather than inferred.
+
+        ``members`` are ids in the delegate's own numbering, not Core AI ids, so they
+        need translating before they name anything in the converted program.
+        """
+
+        group_id: int
+        """Identifier the runtime assigned this dispatch, equal to the event's
+        ``delegate_id``. Assigned per dispatch, so it is meaningful only within the
+        run that reported it."""
+
+        members: tuple[int, ...]
+        """Operation ids fused into this dispatch, in the order reported."""
+
+        @staticmethod
+        def from_dict(data: dict[str, Any]) -> "EventData.CompileIdGroup":
+            """
+            Create a CompileIdGroup from a parsed JSON dictionary.
+
+            Args:
+                data: Parsed JSON dictionary, e.g.
+                    ``{"groupId": 4294967296, "members": [153, 154]}``
+
+            Returns:
+                CompileIdGroup instance populated from the dictionary
+
+            """
+            return EventData.CompileIdGroup(
+                group_id=data["groupId"],
+                members=tuple(data.get("members", ())),
+            )
+
+    compile_id_group: "EventData.CompileIdGroup | None" = None
+    """Fused-dispatch membership for the event, if present."""
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "EventData":
+        """
+        Create an EventData instance from a parsed JSON dictionary.
+
+        The payload is a tagged union: an event carries an ``interval``, a
+        ``compileIdGroup``, or neither.
+
+        Args:
+            data: Parsed JSON dictionary, e.g. ``{"interval": {"duration": 1667}}``
+                or ``{"compileIdGroup": {"groupId": 1, "members": [2, 3]}}``
+
+        Returns:
+            EventData instance populated from the dictionary
+
+        """
+        interval_data = data.get("interval")
+        group_data = data.get("compileIdGroup")
+        return EventData(
+            interval=(
+                EventData.Interval.from_dict(interval_data) if interval_data else None
+            ),
+            compile_id_group=(
+                EventData.CompileIdGroup.from_dict(group_data) if group_data else None
+            ),
+        )
+
+
+def _event_payload(event: LogEvent) -> bytes | str | None:
+    """
+    The event's encoded payload as JSON, if this runtime exposes one.
+
+    Only ``encoded_data`` carries JSON. The neighbouring ``data`` field is a
+    rendering for people, so parsing it yields nothing and is not attempted; a
+    runtime without ``encoded_data`` reports no payload at all.
+
+    Args:
+        event: LogEvent from the profiler.
+
+    Returns:
+        The payload, or ``None`` if the event exposes none.
+
+    """
+    return getattr(event, "encoded_data", None) or None
+
+
+_GPU_INTERVAL_PREFIX = "GPU "
+_HARDWARE_MARKER = " HW "
+
+
+def _is_gpu_interval(event: LogEvent) -> bool:
+    """
+    Whether this event times one GPU encoder.
+
+    Labelled ``GPU HW CB:0, Enc:3`` or ``GPU Host CB:0, Enc:3``. Activity codes, memory
+    intervals and fused-op-group membership are not per-encoder measurements, so they
+    must not be counted as timing this tool failed to recognise.
+
+    Args:
+        event: LogEvent from the profiler.
+
+    Returns:
+        True when the event measures a GPU encoder.
+
+    """
+    return event.event_id.startswith(_GPU_INTERVAL_PREFIX)
+
+
+def _is_hardware_timestamped(event: LogEvent) -> bool:
+    """
+    Whether a GPU interval was measured by the GPU's own counters.
+
+    Every encoder is reported twice, once from the GPU counters and once from the host
+    clock. The host figure includes queueing and does not answer how long the operation
+    took on the GPU, and both carry the same compile identifiers -- so recording both
+    pools two different measurements into one sample list, where a median falls between
+    them and a dispatch's samples run from near zero to the real duration.
+
+    Args:
+        event: LogEvent from the profiler.
+
+    Returns:
+        True when the interval came from the GPU counters.
+
+    """
+    return _HARDWARE_MARKER in event.event_id
+
+
+def _parse_event_data(event_data: bytes | str | None) -> EventData:
+    """
+    Parse a log event's encoded data into a structured EventData object.
+
+    The runtime hands this field over in more than one shape: JSON, as bytes or as
+    str, and a placeholder such as ``"empty()"`` for an event carrying no payload.
+    Anything unrecognised yields an EventData with no interval, so a caller simply
+    finds nothing to attribute.
+
+    Never raises. It runs inside a profiler callback invoked from a runtime thread,
+    where an exception has nowhere to go and can take the process down with it.
+
+    Args:
+        event_data: The event's ``data`` field.
+
+    Returns:
+        EventData parsed from the payload, or an empty one if it holds no JSON
+        object.
+
+    """
+    if not event_data:
+        return EventData()
+
+    if isinstance(event_data, bytes | bytearray):
+        try:
+            event_data = event_data.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.debug("Profiler event data is not valid UTF-8; ignoring it")
+            return EventData()
+
+    try:
+        parsed = json.loads(event_data)
+    except (TypeError, ValueError):
+        # Placeholders such as "empty()" are expected, not an error.
+        logger.debug("Profiler event data is not JSON (%r); ignoring it", event_data)
+        return EventData()
+
+    if not isinstance(parsed, dict):
+        return EventData()
+
+    try:
+        return EventData.from_dict(parsed)
+    except (KeyError, TypeError):
+        logger.debug("Profiler event data lacks an interval duration; ignoring it")
+        return EventData()
 
 
 class Benchmarker(ABC):
@@ -732,14 +990,33 @@ class Benchmarker(ABC):
         self.excluded_operations = excluded_operations or ()
         self.specialization_options = specialization_options
         self._intervals: dict[int, tuple[int, Any]] = {}
-        self._timings: dict[int, list[float]] = defaultdict(list)
+        # Keyed by ``(odix_id, sorted Core AI op ids)``, holding the dispatch's full
+        # undivided duration once per run. Sorted because a delegate reports members
+        # in a varying order, which otherwise splits one dispatch across entries.
+        # ``delegate_id`` cannot key this: for a fused dispatch it is a per-dispatch
+        # counter, so nothing would accumulate.
+        self._timings: dict[tuple[int, tuple[int, ...]], list[float]] = defaultdict(
+            list
+        )
         self._interval_counter = 0
-        self._total_start: int | None = None
-        self._total_end: int | None = None
         self._debug_info_records: list[DebugInfoRecord] = []
-        self._odix_to_coreai_map: dict[int, list[int]] = {}
+        # Maps a compiled op identifier (odix_id, delegate_id) to the list of
+        # coreai op IDs fused into it. Keyed on the same pair carried by a runtime
+        # ``CompileIdentifiers`` object, so timing is attributed without collapsing
+        # distinct delegate dispatches together.
+        self._compile_id_to_coreai_map: dict[tuple[int, int | None], list[int]] = {}
+        # Translates the operation ids a delegate reports into Core AI op ids, so a
+        # dispatch it describes at run time can extend the map above.
+        self._delegate_op_to_coreai_map: dict[int, list[int]] = {}
+        # Durations whose compile identifier is not resolved yet: a delegate reports
+        # a dispatch's timing before describing its membership.
+        self._pending_durations: dict[tuple[int, int | None], list[float]] = (
+            defaultdict(list)
+        )
         self._coreai_operations: dict[int, Operation] = {}
-        self._lock = threading.Lock()
+        # A Condition rather than a Lock so the benchmark coroutine can wait for the
+        # runtime's asynchronous callbacks to settle; otherwise used as a plain Lock.
+        self._lock = threading.Condition()
         self._state = _BenchmarkerState.LOADING
 
     def _extract_coreai_operations(self: Self) -> None:
@@ -760,48 +1037,221 @@ class Benchmarker(ABC):
 
         self.coreai_program._mlir_module.operation.walk(walk_operations)
 
-    def _build_odix_to_coreai_map(self: Self) -> None:
+    def _build_compile_id_to_coreai_map(self: Self) -> None:
         """
-        Build a mapping from ODIX IDs to Core AI operation IDs for fast lookup.
+        Build the mappings that turn compile identifiers into Core AI operation IDs.
 
-        A single ODIX ID can map to multiple Core AI IDs, so we store a list.
-        This should be called once after loading debug_infos.
+        Two are needed, because timing arrives keyed two different ways:
+
+        * ``(odix_id, delegate_id) -> [coreai ids]``, for identifiers the debug info
+          describes statically. A single compiled op may fuse several Core AI ops, so
+          each value is a list.
+        * ``delegate op id -> [coreai ids]``, used to translate the membership a
+          delegate reports for a dispatch whose identifier it assigned at run time.
+
+        Called once after loading debug_infos.
         """
-        self._odix_to_coreai_map.clear()
+        self._compile_id_to_coreai_map = _build_compile_id_to_coreai_map(
+            self._debug_info_records,
+        )
+        self._delegate_op_to_coreai_map = _build_delegate_op_to_source_map(
+            self._debug_info_records,
+        )
 
-        for record in self._debug_info_records:
-            for debug_info in record.operations:
-                odix_id = debug_info.odix_id
-                coreai_id = debug_info.get_op_id("coreai")
-
-                if coreai_id is not None and isinstance(coreai_id, int):
-                    if odix_id not in self._odix_to_coreai_map:
-                        self._odix_to_coreai_map[odix_id] = []
-                    self._odix_to_coreai_map[odix_id].append(coreai_id)
-
-    def _get_coreai_op_ids(self: Self, odix_id: int) -> list[int]:
+    def _get_coreai_op_ids(
+        self: Self,
+        odix_id: int,
+        delegate_id: int | None,
+    ) -> list[int]:
         """
-        Convert ODIX ID from compile_ids to list of Core AI operation IDs using debug_infos.
+        Convert compile identifiers to a list of Core AI operation IDs.
 
         Args:
-            odix_id: ODIX ID from compile_ids.id
+            odix_id: ODIX ID from ``compile_ids.id``
+            delegate_id: Delegate ID from ``compile_ids.delegate_id`` (may be None)
 
         Returns:
             List of Core AI operation IDs if found, otherwise empty list
 
         """
-        return self._odix_to_coreai_map.get(odix_id, [])
+        return self._compile_id_to_coreai_map.get((odix_id, delegate_id), [])
 
     def _reset_state(self: Self) -> None:
         """Reset internal state before a new benchmark run."""
         with self._lock:
             self._intervals.clear()
             self._timings.clear()
+            self._pending_durations.clear()
             self._interval_counter = 0
-            self._total_start = None
-            self._total_end = None
 
-    def _on_log_event_begin(self: Self, event: Any) -> int:
+    def _wait_for_intervals_to_complete(self: Self, timeout_s: float = 10.0) -> None:
+        """
+        Block until every started interval has received its matching end event.
+
+        Callbacks arrive asynchronously, so when ``await function(...)`` returns some
+        intervals may be open. Reaching ``COMPLETED`` first makes their end events hit
+        the ``state != RUNNING`` guard, dropping samples and varying the reported op
+        set between runs. :meth:`_on_log_event_end` wakes this waiter when the last
+        interval closes.
+
+        Call while still ``RUNNING``, via :func:`asyncio.to_thread` so the event loop
+        is not blocked.
+
+        Args:
+            timeout_s: Hard upper bound on the wait.
+
+        """
+        with self._lock:
+            settled = self._lock.wait_for(
+                lambda: not self._intervals,
+                timeout=timeout_s,
+            )
+            if not settled:
+                logger.warning(
+                    "Timed out after %.1fs waiting for %d profiler interval(s) "
+                    "to complete; results may be incomplete",
+                    timeout_s,
+                    len(self._intervals),
+                )
+
+    def _record_dispatch_duration(
+        self: Self,
+        compile_ids: Any,
+        duration_ms: float,
+    ) -> None:
+        """
+        Attribute one measured duration to the dispatch it belongs to.
+
+        Recorded once for the whole dispatch, never divided across the operations it
+        fused: a division reported a fraction of the real cost for each of them.
+        An identifier the delegate assigned at run time is not in the static map and
+        its membership is described only afterwards, so the duration waits in
+        :attr:`_pending_durations` for :meth:`_resolve_compile_id_group` to flush it.
+
+        Caller holds :attr:`_lock`.
+
+        Args:
+            compile_ids: The event's ``CompileIdentifiers``.
+            duration_ms: Measured duration in milliseconds.
+
+        """
+        key = (compile_ids.id, compile_ids.delegate_id)
+        coreai_ids = self._get_coreai_op_ids(*key)
+        if coreai_ids:
+            self._timings[(compile_ids.id, tuple(sorted(coreai_ids)))].append(
+                duration_ms
+            )
+        else:
+            self._pending_durations[key].append(duration_ms)
+
+    def _resolve_compile_id_group(
+        self: Self,
+        compile_ids: Any,
+        group: "EventData.CompileIdGroup",
+    ) -> None:
+        """
+        Learn a dispatch's operations, and attribute whatever was waiting on it.
+
+        Membership comes in the delegate's own numbering, so it is translated to
+        Core AI ids and added to the map static attribution uses -- one place
+        resolves a compile identifier, however it was described.
+
+        Caller holds :attr:`_lock`.
+
+        Args:
+            compile_ids: The event's ``CompileIdentifiers``.
+            group: Membership the delegate reported for this dispatch.
+
+        """
+        key = (compile_ids.id, compile_ids.delegate_id)
+
+        coreai_ids: list[int] = []
+        unresolved: set[int] = set()
+        for member in group.members:
+            mapped = self._delegate_op_to_coreai_map.get(member)
+            if not mapped:
+                unresolved.add(member)
+                continue
+            for coreai_id in mapped:
+                if coreai_id not in coreai_ids:
+                    coreai_ids.append(coreai_id)
+
+        if unresolved:
+            # Members absent from the debug info are attributed to nothing, so name
+            # them rather than quietly reporting a smaller group. Which ids they are
+            # is what says whether attribution is incomplete or the members simply
+            # have no Core AI counterpart, as constants and memref views do not.
+            logger.debug(
+                "Dispatch (odix=%s, delegate=%s): %d of %d reported operations are "
+                "absent from the debug info and are not attributed: %s",
+                key[0],
+                key[1],
+                len(unresolved),
+                len(group.members),
+                sorted(unresolved),
+            )
+
+        pending = self._pending_durations.pop(key, [])
+        if not coreai_ids:
+            if pending:
+                logger.warning(
+                    "No Core AI operations resolved for compile id "
+                    "(odix=%s, delegate=%s), dropping %d timing sample(s)",
+                    key[0],
+                    key[1],
+                    len(pending),
+                )
+            return
+
+        self._compile_id_to_coreai_map[key] = coreai_ids
+        self._timings[(compile_ids.id, tuple(sorted(coreai_ids)))].extend(pending)
+
+    def _on_log_event(self: Self, event: LogEvent) -> None:
+        """
+        Handle a self-contained profiler log event.
+
+        Unlike the begin/end interval callbacks, this event carries its own payload:
+        either a duration, attributed as in :meth:`_on_log_event_end`, or the
+        membership of a fused dispatch, recorded in :attr:`compile_id_groups`.
+
+        Args:
+            event: LogEvent from the profiler
+
+        """
+        # Only process events when actively running benchmark
+        if self._state != _BenchmarkerState.RUNNING:
+            return
+
+        # Only process inference phase events
+        phase = _LogEventPhase(event.phase)
+        if phase != _LogEventPhase.INFERENCE:
+            return
+
+        event_data = _parse_event_data(event_data=_event_payload(event))
+
+        if event_data.compile_id_group is not None:
+            with self._lock:
+                self._resolve_compile_id_group(
+                    event.compile_ids, event_data.compile_id_group
+                )
+            return
+
+        # Without interval timing there is nothing to attribute.
+        if event_data.interval is None:
+            return
+
+        # A GPU encoder first, then which clock measured it. Only the hardware
+        # measurement answers how long the operation took on the GPU.
+        if not (_is_gpu_interval(event) and _is_hardware_timestamped(event)):
+            return
+
+        with self._lock:
+            self._record_dispatch_duration(
+                event.compile_ids,
+                float(event_data.interval.duration) / 1e6,
+            )
+
+    def _on_log_event_begin(self: Self, event: LogEvent) -> int:
         """
         Handle profiler interval begin events.
 
@@ -823,6 +1273,12 @@ class Benchmarker(ABC):
         if phase != _LogEventPhase.INFERENCE:
             return 0  # Return dummy interval_id for non-inference events
 
+        # Opening an interval for the host-timestamped twin would pool it with the
+        # hardware measurement of the same encoder; its end event then finds no open
+        # interval and is ignored.
+        if _is_gpu_interval(event) and not _is_hardware_timestamped(event):
+            return 0
+
         with self._lock:
             interval_id = self._interval_counter
             self._interval_counter += 1
@@ -833,13 +1289,9 @@ class Benchmarker(ABC):
                 event.compile_ids,
             )
 
-            # Track total execution time
-            if self._total_start is None:
-                self._total_start = event.timestamp
-
             return interval_id
 
-    def _on_log_event_end(self: Self, event: Any, interval_id: int) -> None:
+    def _on_log_event_end(self: Self, event: LogEvent, interval_id: int) -> None:
         """
         Handle profiler interval end events.
 
@@ -864,34 +1316,17 @@ class Benchmarker(ABC):
                 # Event was not stored or already processed
                 return
 
-            start_time, compile_ids = start_info
+            start_time, _ = start_info
 
-            # Calculate duration in milliseconds
+            # Calculate duration in milliseconds and attribute it to the group
             duration_ns = event.timestamp - start_time
-            duration_ms = float(duration_ns) / 1e6
+            self._record_dispatch_duration(event.compile_ids, float(duration_ns) / 1e6)
 
-            # Convert ODIX ID to Core AI IDs (there may be multiple)
-            odix_id = compile_ids.id
-            coreai_ids = self._get_coreai_op_ids(odix_id)
-
-            # If we have Core AI IDs, distribute timing equally (mean) to all of them
-            if coreai_ids:
-                # Divide timing equally among all Core AI operations
-                mean_duration_ms = duration_ms / len(coreai_ids)
-                for coreai_id in coreai_ids:
-                    self._timings[coreai_id].append(mean_duration_ms)
-            else:
-                # No Core AI ID mapping found - log warning and skip storing
-                logger.warning(
-                    "No Core AI ID mapping found for ODIX ID %d, skipping timing sample",
-                    odix_id,
-                )
-
-            # Track total execution time
-            self._total_end = event.timestamp
-
-            # Clean up interval
+            # Waking the waiter once the last interval closes is what lets the
+            # benchmark reach COMPLETED without dropping late samples.
             self._intervals.pop(interval_id)
+            if not self._intervals:
+                self._lock.notify_all()
 
     def _create_result(self: Self) -> BenchmarkResult:
         """
@@ -902,31 +1337,74 @@ class Benchmarker(ABC):
 
         """
         with self._lock:
-            total_duration = (
-                self._total_end - self._total_start
-                if self._total_start and self._total_end
-                else 0
-            )
-
-            # Convert raw timings to list of (operation, _OperationTiming) tuples
-            # Filter out excluded operations
+            # Convert raw timings to a list of OperationTiming, one per set of Core
+            # AI ops measured together as a single dispatch.
             operation_timings_list = []
-            for op_id, samples in self._timings.items():
-                operation = self._coreai_operations.get(op_id)
-                if operation is not None:
-                    # Skip excluded operations
-                    if operation.name in self.excluded_operations:
+            for (_odix_id, group_ids), samples in self._timings.items():
+                # Resolve each group member to its MLIR operation, dropping
+                # excluded ops (e.g. coreai.graph / coreai.constant).
+                group_ops: list[Operation] = []
+                group_op_ids: list[int] = []
+                for op_id in group_ids:
+                    operation = self._coreai_operations.get(op_id)
+                    if operation is None or operation.name in self.excluded_operations:
                         continue
+                    group_ops.append(operation)
+                    group_op_ids.append(op_id)
 
-                    timing = OperationTiming(
-                        op_id=op_id,
+                # Skip groups whose members were all unknown or excluded.
+                if not group_ops:
+                    continue
+
+                operation_timings_list.append(
+                    OperationTiming(
+                        op_ids=group_op_ids,
+                        operations=group_ops,
                         measurement=Measurement.from_samples(samples),
                     )
-                    operation_timings_list.append((operation, timing))
+                )
+
+            # Durations whose description never arrived. Most measure a whole
+            # function or delegate region -- a "symbol" in the debug info -- and are
+            # excluded from per-op timing by design. The rest name no dispatch at
+            # all, because an interval does not always carry a delegate_id.
+            if self._pending_durations:
+                symbol_odix_ids = {
+                    operation.odix_id
+                    for record in self._debug_info_records
+                    for operation in record.operations
+                    if operation.is_symbol()
+                }
+                symbols = {
+                    compile_id: durations
+                    for compile_id, durations in self._pending_durations.items()
+                    if compile_id[0] in symbol_odix_ids
+                }
+                unnamed = {
+                    compile_id: durations
+                    for compile_id, durations in self._pending_durations.items()
+                    if compile_id[0] not in symbol_odix_ids
+                }
+                if symbols:
+                    logger.debug(
+                        "%d sample(s) measure a whole function or delegate region "
+                        "rather than an operation, and are excluded from per-op "
+                        "timing: %s",
+                        sum(len(d) for d in symbols.values()),
+                        sorted(symbols, key=str),
+                    )
+                if unnamed:
+                    logger.warning(
+                        "%d timing sample(s) across %d compile identifier(s) were "
+                        "measured but could not be attributed to any operation: %s",
+                        sum(len(d) for d in unnamed.values()),
+                        len(unnamed),
+                        sorted(unnamed, key=str),
+                    )
 
             return BenchmarkResult(
                 operation_timings=operation_timings_list,
-                total_duration_ns=total_duration,
+                operations_by_id=dict(self._coreai_operations),
             )
 
     @abstractmethod
@@ -940,7 +1418,9 @@ class Benchmarker(ABC):
 
         Args:
             inputs: Dictionary mapping input names to tensor values
-            num_runs: Number of times to run the benchmark (default: 1)
+            num_runs: Number of timed iterations (default: 1). Always preceded by an
+                untimed warmup run, which is not one of them, so the samples describe
+                the steady state rather than first-inference costs.
 
         Returns:
             BenchmarkResult containing timing information for all operations
@@ -962,7 +1442,9 @@ class CoreAIBenchmarker(Benchmarker):
 
         Args:
             inputs: Dictionary mapping input names to tensor values
-            num_runs: Number of times to run the benchmark (default: 1)
+            num_runs: Number of timed iterations (default: 1). Always preceded by an
+                untimed warmup run, which is not one of them, so the samples describe
+                the steady state rather than first-inference costs.
 
         Returns:
             BenchmarkResult containing timing information
@@ -990,13 +1472,14 @@ class CoreAIBenchmarker(Benchmarker):
             # Extract Core AI operations from module
             self._extract_coreai_operations()
 
-            # Build ODIX to Core AI ID mapping for fast lookup
-            self._build_odix_to_coreai_map()
+            # Build compile-id to Core AI ID mapping for fast lookup
+            self._build_compile_id_to_coreai_map()
 
             # Create profiler with callbacks
             profiler = Profiler(
                 on_log_event_begin=self._on_log_event_begin,
                 on_log_event_end=self._on_log_event_end,
+                on_log_event=self._on_log_event,
             )
 
             # Load function with profiler
@@ -1019,6 +1502,18 @@ class CoreAIBenchmarker(Benchmarker):
                 num_runs,
             )
 
+            # A first inference pays costs the steady state does not, and nothing
+            # filters it out -- it dominated the mean, three orders of magnitude
+            # above the median. Run one iteration before collection starts, so the
+            # state guard discards its events.
+            #
+            # Unconditional, and not one of the `num_runs`: exempting `num_runs=1`
+            # made the cheapest way to ask for a measurement the one way to get a
+            # cold one, so a single-run number was not comparable with any other --
+            # including the other side of a `timing_diff` comparison.
+            logger.debug("Warmup run (untimed)")
+            await function(nd_inputs)
+
             # Transition to RUNNING state to start collecting timing data
             self._state = _BenchmarkerState.RUNNING
 
@@ -1026,16 +1521,14 @@ class CoreAIBenchmarker(Benchmarker):
                 logger.debug("Benchmark run %d/%d", i + 1, num_runs)
                 await function(nd_inputs)
 
-            # Transition to COMPLETED state to stop collecting timing data
-            self._state = _BenchmarkerState.COMPLETED
+            # Callbacks arrive asynchronously, so intervals from the final runs may
+            # still be open. Block (off the event loop) until they close: flipping to
+            # COMPLETED first drops late end events, and the reported op set then
+            # varies between identical runs.
+            await asyncio.to_thread(self._wait_for_intervals_to_complete)
 
-            # Ensure all profiler callbacks have completed before creating result
-            # The runtime should ensure callback completion after function execution,
-            # but we add explicit synchronization to be safe
-            with self._lock:
-                # At this point, all function executions are complete, and this lock
-                # ensures any remaining callback processing is finished
-                pass
+            # All intervals have closed; stop collecting and build the result.
+            self._state = _BenchmarkerState.COMPLETED
 
             result = self._create_result()
             logger.info(

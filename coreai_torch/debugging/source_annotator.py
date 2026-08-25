@@ -9,13 +9,14 @@ Generic source annotation for Core AI operations.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self, TextIO
+from typing import Any, Self, TextIO
 
 import coreai._compiler._mlir_libs._coreaiIR._bindings.mlir as _mlir
 from coreai._compiler.ir import Operation
@@ -28,7 +29,12 @@ from .annotations import (
     _TextAnnotation,
     _write_line,
 )
-from .utils import LocationInfo, _walk_operations, get_operation_locations
+from .utils import (
+    LocationInfo,
+    _walk_operations,
+    get_operation_locations,
+    split_module_frame,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +55,21 @@ __all__ = [
 # ("HierarchicalModel$1", "SubModel$2")). Disambiguates instances of the same
 # submodule that share a source file/line.
 ModulePath = tuple[str, ...]
+
+
+def _module_step(frame: str) -> dict[str, Any]:
+    """
+    One step of a module path, as plain values.
+
+    Args:
+        frame: Module frame, e.g. ``"Linear$3"``.
+
+    Returns:
+        The frame verbatim, plus its type and instance number.
+
+    """
+    type_name, instance = split_module_frame(frame)
+    return {"name": frame, "type_name": type_name, "instance": instance}
 
 
 @dataclass(frozen=True)
@@ -376,6 +397,54 @@ class _SourceAnnotator:
             if module is None or attributed.module == module
         ]
 
+    def annotation_data(self: Self, filename: str | Path) -> list[dict[str, Any]]:
+        """
+        Every annotation in a file as plain values, ready to serialize.
+
+        One call per file rather than per line, so a consumer that decorates source
+        -- an editor, say -- gets the whole file's annotations without walking it.
+
+        Args:
+            filename: Source file to describe.
+
+        Returns:
+            One entry per annotation, each holding its 1-based ``line``, the
+            ``module`` instance path it was attributed to, and the annotation's own
+            fields from :meth:`_Annotation.data`. Ordered by line.
+
+            Each step of ``module`` is split into ``name``, ``type_name`` and
+            ``instance``, so a consumer can group instances of one module type
+            without parsing ``Linear$3`` itself.
+
+            Identical entries are collapsed. Every member of a fused dispatch
+            attributes separately, and members often share a line, so the same
+            record would otherwise repeat -- once drawn per member, or counted once
+            per member by anything adding the durations up.
+
+        """
+        line_annotations = self._file_line_annotations.get(_normalize_path(filename))
+        if line_annotations is None:
+            return []
+
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for line in sorted(line_annotations):
+            for attributed in line_annotations[line]:
+                entry = {
+                    "line": line,
+                    "module": [_module_step(frame) for frame in attributed.module],
+                    **attributed.annotation.data(),
+                }
+                # The whole entry is the identity: for a timing annotation that is
+                # line, module and op ids, and for any other kind whatever it
+                # reports. Serialized because the values include lists.
+                key = json.dumps(entry, sort_keys=True, default=str)
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append(entry)
+        return entries
+
     def modules_at(self: Self, filename: str | Path, line: int) -> list[ModulePath]:
         """
         Get the distinct module instance paths attributed to a file and line.
@@ -476,6 +545,9 @@ class _SourceAnnotator:
         listing = _AnnotatedListing(
             lines=[line.rstrip("\n") for line in source_lines],
             header=f"\n# === {file_path} [{module_label}] ===",
+            # Follow the indentation of the annotated line, so a comment sits with
+            # the code it describes instead of breaking out to column zero.
+            align_to_line=True,
         )
 
         line_annotations = self._file_line_annotations.get(

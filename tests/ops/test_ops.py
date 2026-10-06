@@ -1239,6 +1239,35 @@ class TestConstantPadNd:
         dynamic_shapes = self._dynamic_shapes(x) if dynamic else None
         await validate_numerical_output(model=model, x=x, dynamic_shapes=dynamic_shapes)
 
+    @pytest.mark.parametrize("value", [0.0, 7.0])
+    @pytest.mark.parametrize(
+        "make_pad",
+        [
+            lambda x: (0, x.shape[-1]),  # pad last dim by its own (dynamic) size
+            lambda x: (0, 0, 0, x.shape[0]),  # pad 2nd-to-last dim by dim0's size
+        ],
+        ids=["pad-last", "pad-dim-2"],
+    )
+    async def test_dynamic_pad_amount(self, make_pad, value: float) -> None:
+        """Pad amount is a runtime value (symbolic ``fx.Node``), not a compile-time
+        constant, so ``coreai.pad`` receives a runtime padding tensor rather than a
+        constant. Covers padding the last and 2nd-to-last dims.
+        """
+
+        class PadModel(nn.Module):
+            def forward(self, x: Tensor) -> Tensor:
+                return torch.nn.functional.pad(
+                    x, make_pad(x), mode="constant", value=value
+                )
+
+        x = torch.rand(2, 5)
+        dynamic_shapes = {
+            "x": {0: torch.export.Dim("b", min=1), 1: torch.export.Dim("n", min=1)}
+        }
+        await validate_numerical_output(
+            model=PadModel().eval(), x=x, dynamic_shapes=dynamic_shapes
+        )
+
 
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize(
@@ -2711,7 +2740,7 @@ async def test_local_scalar_dense(x: Tensor, col: Tensor, dynamic: bool) -> None
     class SelectColModel(nn.Module):
         def forward(self, x: Tensor, col: Tensor) -> Tensor:
             c = col.item()
-            torch._check_is_size(c)
+            torch._check(c >= 0)
             torch._check(
                 c + 1 <= x.shape[1]
             )  # shape[1]=4 is static, provable at export time

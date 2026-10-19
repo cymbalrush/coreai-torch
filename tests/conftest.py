@@ -12,6 +12,33 @@ import pytest
 _COMPUTE_UNIT_KIND_CHOICES = ("interpreter", "cpu", "gpu", "neural_engine")
 _COMPUTE_UNIT_KIND_DEFAULT = "interpreter"
 
+
+def _compute_unit_kind_from_argv(argv: list[str]) -> str:
+    """The ``--compute-unit-kind`` on the command line, before pytest has parsed it."""
+    for index, arg in enumerate(argv):
+        if arg.startswith("--compute-unit-kind="):
+            return arg.split("=", 1)[1]
+        if arg == "--compute-unit-kind" and index + 1 < len(argv):
+            return argv[index + 1]
+    return _COMPUTE_UNIT_KIND_DEFAULT
+
+
+def _pin_runtime(compute_unit_kind: str) -> None:
+    """Select the Core AI runtime for *compute_unit_kind*; see `pytest_configure`."""
+    if compute_unit_kind == "interpreter":
+        os.environ.setdefault("USE_LOCAL_COREAI", "1")
+    else:
+        os.environ.pop("USE_LOCAL_COREAI", None)
+
+
+# Pinned at import as well as in `pytest_configure`, because configure is too late
+# whenever a path is given: pytest imports the conftests along it first, and
+# `tests/debugging/conftest.py` imports `tests/utils.py`, which imports
+# `coreai.runtime` — the moment the runtime is chosen. `pytest tests/debugging/...`
+# therefore ran its "interpreter" tests on the OS framework, where default options
+# load MPSGraph. This conftest is imported before any below it.
+_pin_runtime(_compute_unit_kind_from_argv(__import__("sys").argv))
+
 _current_test_id: str = ""
 
 
@@ -66,10 +93,7 @@ def pytest_configure(config: pytest.Config) -> None:
     compute units — gets picked up.
     """
     compute_unit_kind = config.getoption("--compute-unit-kind")
-    if compute_unit_kind == "interpreter":
-        os.environ.setdefault("USE_LOCAL_COREAI", "1")
-    else:
-        os.environ.pop("USE_LOCAL_COREAI", None)
+    _pin_runtime(compute_unit_kind)
 
     from tests import utils
 

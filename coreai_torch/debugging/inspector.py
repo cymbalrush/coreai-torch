@@ -1045,7 +1045,23 @@ class CoreAIInspector(Inspector):
             intermediate_logger=intermediate_logger,
         )
 
-        outputs = await inference_function(inputs=ndarray_inputs)
+        # A stateful function takes its state apart from its inputs. Each array
+        # is wrapped afresh above, which copies it, so the run's in-place update
+        # of the state never reaches the caller's arrays.
+        state_names = set(inference_function.desc.state_names)
+        outputs = await inference_function(
+            inputs={
+                name: value
+                for name, value in ndarray_inputs.items()
+                if name not in state_names
+            },
+            state={
+                name: value
+                for name, value in ndarray_inputs.items()
+                if name in state_names
+            }
+            or None,
+        )
         await _wait_for_async_callbacks()
 
         self._last_outputs = {name: array.numpy() for name, array in outputs.items()}

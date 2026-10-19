@@ -18,11 +18,12 @@ import coreai._compiler._mlir_libs._coreaiIR._bindings.mlir as _mlir
 import numpy as np
 import torch
 import torch.fx
-from coreai._compiler.ir import Operation, WalkResult
+from coreai._compiler.ir import Operation, StringAttr, WalkResult
 from coreai.authoring import AIProgram
 from torch.export import ExportedProgram
 
 from coreai_torch._compression._intx import SubbyteTensor
+from coreai_torch._debug_locations import SOURCE_NAMES_ATTRIBUTE
 
 from .debug_info import (
     CompilationMappings,
@@ -632,6 +633,43 @@ def _deduplicate_torch_identifiers_by_coreai_output(
     return result
 
 
+def get_torch_node_names(coreai_program: AIProgram) -> dict[int, str]:
+    """
+    Name the FX node behind each torch operation ID an output map can cite.
+
+    The converter records the whole table on the module
+    (:data:`~coreai_torch._debug_locations.SOURCE_NAMES_ATTRIBUTE`), so an ID
+    names its node even when the compiler folded away every op lowered from it
+    and moved its output map to another op holding its value. A program converted
+    before the table existed is named from the ``sources`` of the ops that
+    survive, which misses those IDs.
+
+    Args:
+        coreai_program: The AIProgram to read the names from.
+
+    Returns:
+        FX node name by torch operation ID.
+
+    """
+    names: dict[int, str] = {}
+
+    def collect_torch_identifiers(operation: Operation) -> WalkResult:
+        result_info = _extract_torch_source_info_from_location(operation.location)
+        if result_info is not None:
+            torch_op_id, identifier = result_info
+            names[torch_op_id] = identifier
+        return WalkResult.ADVANCE
+
+    module = coreai_program._module._mlir_module  # noqa: SLF001
+    module.operation.walk(collect_torch_identifiers)
+
+    attributes = module.operation.attributes
+    if SOURCE_NAMES_ATTRIBUTE in attributes:
+        for torch_op_id, name in enumerate(attributes[SOURCE_NAMES_ATTRIBUTE]):
+            names[torch_op_id] = StringAttr(name).value
+    return names
+
+
 def get_torch_to_coreai_output_mapping(
     coreai_program: AIProgram,
 ) -> dict[str, OutputMapping]:
@@ -669,16 +707,15 @@ def get_torch_to_coreai_output_mapping(
 
     # Build mapping from torch operation IDs to identifiers, and each coreai op's
     # primary torch op.
-    torch_op_id_to_identifier: dict[int, str] = {}
+    torch_op_id_to_identifier = get_torch_node_names(coreai_program)
     coreai_op_id_to_torch_op_id: dict[int, int] = {}
     last_coreai_op_id_by_torch_op_id: dict[int, int] = {}
 
     def collect_torch_identifiers(operation: Operation) -> WalkResult:
-        """Collect torch operation IDs and their single identifier."""
+        """Collect each coreai op's primary torch op."""
         result_info = _extract_torch_source_info_from_location(operation.location)
         if result_info is not None:
-            torch_op_id, identifier = result_info
-            torch_op_id_to_identifier[torch_op_id] = identifier
+            torch_op_id, _ = result_info
             coreai_op_id = get_operation_id(operation)
             if coreai_op_id is not None:
                 coreai_op_id_to_torch_op_id[coreai_op_id] = torch_op_id

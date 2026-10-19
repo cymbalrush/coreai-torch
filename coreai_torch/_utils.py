@@ -7,7 +7,7 @@ import math
 import os
 import re
 import sys
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Generator, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -137,7 +137,7 @@ class _ProgressBar:
         self._progress.console.print(*args, **kwargs)
 
     @contextmanager
-    def stream(self, description: str) -> Iterator[Callable[[], None]]:
+    def stream(self, description: str) -> Generator[Callable[[], None], None, None]:
         """Yield an ``advance()`` callback for a transient indeterminate task.
 
         Use when the iterable can't be materialized upfront (e.g. a stateful
@@ -152,7 +152,7 @@ class _ProgressBar:
         self._progress.remove_task(task_id)
 
     @contextmanager
-    def status(self, description: str) -> Iterator[None]:
+    def status(self, description: str) -> Generator[None, None, None]:
         """Show a transient spinner-only display during a slow opaque step.
 
         The existing progress bars are paused (and their display cleared,

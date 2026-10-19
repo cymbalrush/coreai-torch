@@ -50,6 +50,9 @@ from ._utils import (
     parse_traceback,
 )
 
+SOURCE_NAMES_ATTRIBUTE = "coreai_torch.torch_node_names"
+"""Module attribute naming the FX node of each torch operation ID: element *i* is ID *i*."""
+
 # Set up logger
 logger = logging.getLogger(__name__)
 
@@ -752,6 +755,8 @@ class _DebugInfoRecorder:
         self.config = config
         self.module_registry = _ModuleInstanceRegistry()
         self._source_operation_id = 0
+        # The FX node each torch operation ID was given to, indexed by the ID.
+        self._source_names: list[str] = []
         self._debug_info_map = _DebugInfoMap()
         self._current_module: Module | None = None
         self._current_graph: Operation | None = None
@@ -951,6 +956,22 @@ class _DebugInfoRecorder:
         # Set the location on the graph operation
         set_op_location(graph_operation, debug_location)
 
+    def _set_source_names(self: Self, module: Module) -> None:
+        """Record on *module* which FX node each torch operation ID names.
+
+        Output maps name their torch source by ID alone, and the only other record
+        of which node an ID belongs to is the ``sources`` metadata of the ops
+        lowered from it. The compiler can fold those ops away while their value
+        lives on in another op -- a ``view`` whose reshape folds into its neighbour
+        -- and moves the node's output map there; the ID is then mapped but names
+        no node. This table names every ID, whatever survives compilation.
+        """
+        context = module.operation.context
+        module.operation.attributes[SOURCE_NAMES_ATTRIBUTE] = ArrayAttr.get(
+            [StringAttr.get(name, context=context) for name in self._source_names],
+            context=context,
+        )
+
     def _set_module_location(self: Self, module: Module) -> None:
         """Set debug location for a module.
 
@@ -1027,7 +1048,10 @@ class _DebugInfoRecorder:
 
             output_map = OutputMap.create_torch_mapping(
                 source_output=i,
-                target_output=i,
+                # The result's index on its own op: a node lowered to several ops
+                # -- `max.dim` to a `reduce_max` and an `argmax` -- returns results
+                # of different ops, each its op's result 0.
+                target_output=target_result.result_number,
                 source_op_id=source_op_id,
                 target_op_id=None,
                 source_level="torch",
@@ -1068,6 +1092,7 @@ class _DebugInfoRecorder:
         yield module
         # Set module location before restoring context
         self._set_module_location(module)
+        self._set_source_names(module)
 
         # Verify that each location is a debuginfo location when enabled
         if self.config.verify_debuginfo_locations:
@@ -1268,6 +1293,7 @@ class _DebugInfoRecorder:
 
         source_op_id = self._source_operation_id
         self._source_operation_id += 1
+        self._source_names.append(node.name)
 
         # Create location from debug info
         location = self._create_location_for_node(debug_info)
